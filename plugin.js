@@ -1,9 +1,15 @@
 /**
- * Enhanced Search — Thymer plugin v1.0.0
+ * Enhanced Search — Thymer plugin v1.1.0
  * Cross-collection record viewer with filters (see README).
+ * Modes: Search, Duplicates (analysis), Compare (2–3 notes + diff).
  */
 const PLUGIN_NAME = 'Enhanced Search';
-const PLUGIN_VERSION = '1.0.0';
+const PLUGIN_VERSION = '1.1.0';
+
+/** Skip duplicate/similar scans above this many records (per selected collections). */
+const DUPLICATE_SCAN_MAX_RECORDS = 2500;
+/** Max records for pairwise similar-body scan (performance). */
+const CONTENT_SIMILAR_MAX_RECORDS = 500;
 
 class Plugin extends AppPlugin {
   /** Enhanced Search viewer panels by `panel.getId()` (refs from getPanels() may differ from register callback). */
@@ -17,6 +23,15 @@ class Plugin extends AppPlugin {
   _isJournalResults = false;
   /** When false, search used `@collection=…` — don’t filter results/cards by sidebar checkboxes. */
   _filterRecordsByCollectionCheckboxes = true;
+
+  /** `search` | `duplicates` | `compare` */
+  _panelMode = 'search';
+  /** @type {{ label: string, records: object[] }[]|null} */
+  _dupGroups = null;
+  /** Up to 3 record GUIDs selected for compare */
+  _compareGuids = [];
+  /** True when main area shows diff / triple view instead of cards */
+  _compareDiffOpen = false;
 
   // ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -163,9 +178,12 @@ class Plugin extends AppPlugin {
     this._pageSize = this._readPageSize();
     this._bindEvents(el);
     this._syncSearchClear(el);
+    this._syncDupKindUI(el);
     this._bindCardActions(el, panel);
     this._renderPresets(el);
+    this._renderDupPresets(el);
     this._updateTypeSearchCheckboxVisibility(el);
+    this._applyPanelMode(el);
     this._runSearch(el);
   }
 
@@ -278,6 +296,10 @@ class Plugin extends AppPlugin {
   }
 
   async _renderCurrentPage(el) {
+    if (this._panelMode === 'compare') {
+      await this._renderCompareMain(el);
+      return;
+    }
     const list = this._matchRecords;
     if (!list || !list.length) return;
     const total = list.length;
@@ -285,7 +307,7 @@ class Plugin extends AppPlugin {
       [...el.querySelectorAll('.rv-col-list input:checked')].map(cb => cb.dataset.colGuid)
     );
     const batch = list.slice(this._pageStart, this._pageStart + this._pageSize);
-    const cards = await Promise.all(batch.map(r => this._buildCard(r, selectedGuids, this._isJournalResults)));
+    const cards = await Promise.all(batch.map(r => this._buildCard(r, selectedGuids, this._isJournalResults, { compareBtn: true })));
     const html = cards.filter(Boolean).join('');
     const container = el.querySelector('.rv-cards-list');
     if (container) container.innerHTML = html;
@@ -309,9 +331,21 @@ class Plugin extends AppPlugin {
   }
 
   async _loadNextPage(el) {
-    const list = this._matchRecords;
-    if (!list || !list.length) return;
-    const total = list.length;
+    let total;
+    if (this._panelMode === 'compare') {
+      const filterRaw = el.querySelector('.rv-compare-filter')?.value ?? '';
+      const { filtered } = _filterRecordsForCompareDisplay(
+        this._matchRecords || [],
+        filterRaw,
+        this._recordColMap
+      );
+      total = filtered.length;
+    } else {
+      const list = this._matchRecords;
+      if (!list || !list.length) return;
+      total = list.length;
+    }
+    if (!total) return;
     const nextStart = this._pageStart + this._pageSize;
     if (nextStart >= total) return;
     this._pageStart = nextStart;
@@ -341,6 +375,8 @@ class Plugin extends AppPlugin {
 
   _presetsKey() { return 'rv_presets_' + this.getWorkspaceGuid(); }
 
+  _dupPresetsKey() { return 'rv_dup_presets_' + this.getWorkspaceGuid(); }
+
   _getPresets() {
     try { return JSON.parse(localStorage.getItem(this._presetsKey()) || '[]'); }
     catch { return []; }
@@ -349,6 +385,53 @@ class Plugin extends AppPlugin {
   _savePresets(presets) {
     try { localStorage.setItem(this._presetsKey(), JSON.stringify(presets)); }
     catch { /* ignore */ }
+  }
+
+  _getDupPresets() {
+    try { return JSON.parse(localStorage.getItem(this._dupPresetsKey()) || '[]'); }
+    catch { return []; }
+  }
+
+  _saveDupPresets(presets) {
+    try { localStorage.setItem(this._dupPresetsKey(), JSON.stringify(presets)); }
+    catch { /* ignore */ }
+  }
+
+  _getDupState(el) {
+    const thrEl = el.querySelector('.rv-dup-threshold');
+    return {
+      kind: el.querySelector('.rv-dup-kind')?.value || 'title_similar',
+      threshold: thrEl ? parseInt(thrEl.value, 10) : 85,
+      titleVariant: !!el.querySelector('.rv-dup-title-variant')?.checked,
+      dupFilter: el.querySelector('.rv-dup-filter')?.value ?? '',
+      collections: [...el.querySelectorAll('.rv-col-list input:checked')].map(cb => cb.dataset.colGuid),
+    };
+  }
+
+  async _applyDupState(el, state) {
+    const kinds = ['title_exact', 'title_similar', 'content_exact', 'content_similar'];
+    const kind = kinds.includes(state.kind) ? state.kind : 'title_similar';
+    const sel = el.querySelector('.rv-dup-kind');
+    if (sel) sel.value = kind;
+    const thr = el.querySelector('.rv-dup-threshold');
+    if (thr) {
+      const raw = Number(state.threshold);
+      const v = Number.isFinite(raw) ? Math.min(100, Math.max(70, Math.round(raw))) : 85;
+      thr.value = String(v);
+      const lab = el.querySelector('.rv-dup-threshold-val');
+      if (lab) lab.textContent = v + '%';
+    }
+    const tv = el.querySelector('.rv-dup-title-variant');
+    if (tv) tv.checked = state.titleVariant !== false;
+    const df = el.querySelector('.rv-dup-filter');
+    if (df) df.value = state.dupFilter != null ? String(state.dupFilter) : '';
+    el.querySelectorAll('.rv-col-list input').forEach(cb => {
+      cb.checked = (state.collections || []).includes(cb.dataset.colGuid);
+    });
+    this._updateTypeSearchCheckboxVisibility(el);
+    this._syncDupKindUI(el);
+    this._setPanelMode(el, 'duplicates');
+    await this._runDuplicateAnalysis(el);
   }
 
   _getFilterState(el) {
@@ -394,6 +477,8 @@ class Plugin extends AppPlugin {
 
   _presetEditMode = false;
 
+  _dupPresetEditMode = false;
+
   _renderPresets(el) {
     const presets = this._getPresets();
     const list = el.querySelector('.rv-preset-list');
@@ -420,6 +505,34 @@ class Plugin extends AppPlugin {
     // Update toggle button appearance
     const toggle = el.querySelector('.rv-preset-edit-toggle');
     if (toggle) toggle.style.opacity = this._presetEditMode ? '1' : '0.45';
+  }
+
+  _renderDupPresets(el) {
+    const presets = this._getDupPresets();
+    const list = el.querySelector('.rv-dup-preset-list');
+    if (!list) return;
+    list.innerHTML = '';
+    if (presets.length === 0) {
+      list.innerHTML = '<div class="rv-preset-empty">No saved presets yet</div>';
+      return;
+    }
+    presets.forEach((preset, i) => {
+      const row = document.createElement('div');
+      row.className = 'rv-dup-preset-row';
+      if (this._dupPresetEditMode) {
+        row.innerHTML = `
+          <span class="rv-dup-preset-name-label">${_esc(preset.name)}</span>
+          <button type="button" class="rv-dup-preset-del" data-index="${i}" title="Delete">
+            <span class="ti ti-trash"></span>
+          </button>`;
+      } else {
+        row.innerHTML = `
+          <button type="button" class="rv-dup-preset-load" data-index="${i}">${_esc(preset.name)}</button>`;
+      }
+      list.appendChild(row);
+    });
+    const toggle = el.querySelector('.rv-dup-preset-edit-toggle');
+    if (toggle) toggle.style.opacity = this._dupPresetEditMode ? '1' : '0.45';
   }
 
   _bindEvents(el) {
@@ -463,19 +576,19 @@ class Plugin extends AppPlugin {
     // Collection checkboxes
     el.querySelector('.rv-col-list').addEventListener('change', () => {
       this._updateTypeSearchCheckboxVisibility(el);
-      this._runSearch(el);
+      if (this._panelMode === 'search') this._runSearch(el);
     });
 
     // Select all / none
     el.querySelector('.rv-col-all').addEventListener('click', () => {
       el.querySelectorAll('.rv-col-list input').forEach(cb => cb.checked = true);
       this._updateTypeSearchCheckboxVisibility(el);
-      this._runSearch(el);
+      if (this._panelMode === 'search') this._runSearch(el);
     });
     el.querySelector('.rv-col-none').addEventListener('click', () => {
       el.querySelectorAll('.rv-col-list input').forEach(cb => cb.checked = false);
       this._updateTypeSearchCheckboxVisibility(el);
-      this._runSearch(el);
+      if (this._panelMode === 'search') this._runSearch(el);
     });
 
     el.querySelector('.rv-search-include-type')?.addEventListener('change', () => this._runSearch(el));
@@ -554,6 +667,41 @@ class Plugin extends AppPlugin {
       this._renderPresets(el);
     });
 
+    el.querySelector('.rv-dup-preset-save')?.addEventListener('click', () => {
+      const nameInput = el.querySelector('.rv-dup-preset-name');
+      const name = nameInput?.value.trim();
+      if (!name) {
+        nameInput?.focus();
+        return;
+      }
+      const presets = this._getDupPresets();
+      presets.push({ name, state: this._getDupState(el) });
+      this._saveDupPresets(presets);
+      nameInput.value = '';
+      this._renderDupPresets(el);
+    });
+
+    el.querySelector('.rv-dup-preset-list')?.addEventListener('click', e => {
+      const loadBtn = e.target.closest('.rv-dup-preset-load');
+      const delBtn = e.target.closest('.rv-dup-preset-del');
+      if (loadBtn) {
+        const idx = parseInt(loadBtn.dataset.index, 10);
+        if (!isNaN(idx)) void this._applyDupState(el, this._getDupPresets()[idx].state);
+      } else if (delBtn) {
+        const idx = parseInt(delBtn.dataset.index, 10);
+        if (isNaN(idx)) return;
+        const presets = this._getDupPresets();
+        presets.splice(idx, 1);
+        this._saveDupPresets(presets);
+        this._renderDupPresets(el);
+      }
+    });
+
+    el.querySelector('.rv-dup-preset-edit-toggle')?.addEventListener('click', () => {
+      this._dupPresetEditMode = !this._dupPresetEditMode;
+      this._renderDupPresets(el);
+    });
+
     // Sort (delegated — toolbar is re-rendered after each search)
     el.addEventListener('change', e => {
       if (!e.target.classList?.contains('rv-sort-select')) return;
@@ -565,11 +713,317 @@ class Plugin extends AppPlugin {
       this._pageStart = 0;
       this._renderCurrentPage(el);
     });
+
+    el.querySelector('.rv-mode-bar')?.addEventListener('click', e => {
+      const btn = e.target.closest('.rv-mode-btn');
+      if (!btn?.dataset.mode) return;
+      this._setPanelMode(el, btn.dataset.mode);
+    });
+
+    el.querySelector('.rv-dup-run')?.addEventListener('click', () => this._runDuplicateAnalysis(el));
+
+    el.querySelector('.rv-compare-open')?.addEventListener('click', () => this._openCompareDiff(el));
+
+    el.querySelector('.rv-compare-clear')?.addEventListener('click', () => {
+      this._compareGuids = [];
+      this._compareDiffOpen = false;
+      this._syncCompareTray(el);
+      this._renderCompareMain(el);
+    });
+
+    el.querySelector('.rv-compare-tray')?.addEventListener('click', e => {
+      const rm = e.target.closest('.rv-compare-rm');
+      if (!rm?.dataset.guid) return;
+      this._compareGuids = this._compareGuids.filter(g => g !== rm.dataset.guid);
+      this._syncCompareTray(el);
+    });
+
+    el.querySelector('.rv-dup-kind')?.addEventListener('change', () => this._syncDupKindUI(el));
+
+    el.querySelector('.rv-dup-threshold')?.addEventListener('input', e => {
+      const lab = el.querySelector('.rv-dup-threshold-val');
+      if (lab) lab.textContent = e.target.value + '%';
+    });
+
+    let dupFilterDebounce = null;
+    el.querySelector('.rv-dup-filter')?.addEventListener('input', () => {
+      clearTimeout(dupFilterDebounce);
+      dupFilterDebounce = setTimeout(() => {
+        if (this._dupGroups?.length) this._renderDuplicateResults(el, this._dupGroups);
+      }, 200);
+    });
+
+    let compareFilterDebounce = null;
+    el.querySelector('.rv-compare-filter')?.addEventListener('input', () => {
+      clearTimeout(compareFilterDebounce);
+      compareFilterDebounce = setTimeout(() => {
+        if (this._panelMode === 'compare') {
+          this._pageStart = 0;
+          this._renderCompareMain(el);
+        }
+      }, 200);
+    });
+  }
+
+  _syncDupKindUI(el) {
+    const k = el.querySelector('.rv-dup-kind')?.value;
+    const tw = el.querySelector('.rv-dup-threshold-wrap');
+    if (tw) tw.style.display = k === 'title_similar' || k === 'content_similar' ? '' : 'none';
+    const vw = el.querySelector('.rv-dup-title-variant-wrap');
+    if (vw) vw.style.display = k === 'title_similar' ? 'flex' : 'none';
+  }
+
+  _setPanelMode(el, mode) {
+    if (!['search', 'duplicates', 'compare'].includes(mode)) return;
+    this._panelMode = mode;
+    this._compareDiffOpen = false;
+    this._applyPanelMode(el);
+    if (mode === 'search') {
+      this._runSearch(el);
+    } else if (mode === 'duplicates') {
+      this._dupGroups = null;
+      this._renderDuplicatePlaceholder(el);
+    } else {
+      this._renderCompareMain(el);
+    }
+  }
+
+  _applyPanelMode(el) {
+    const sb = el.querySelector('.rv-sidebar');
+    if (!sb) return;
+    sb.classList.remove('rv-sidebar--mode-search', 'rv-sidebar--mode-duplicates', 'rv-sidebar--mode-compare');
+    sb.classList.add('rv-sidebar--mode-' + this._panelMode);
+    el.querySelectorAll('.rv-mode-btn').forEach(b => {
+      b.classList.toggle('rv-mode-btn--active', b.dataset.mode === this._panelMode);
+    });
+    this._syncCompareTray(el);
+  }
+
+  _syncCompareTray(el) {
+    const tray = el.querySelector('.rv-compare-tray');
+    const openBtn = el.querySelector('.rv-compare-open');
+    if (!tray) return;
+    const guids = this._compareGuids;
+    tray.innerHTML = guids
+      .map(g => {
+        const r = this.data.getRecord(g);
+        const name = r ? _truncateDisplay(r.getName() || '(untitled)', 28) : g.slice(0, 8);
+        return `<span class="rv-compare-chip"><span class="rv-compare-chip-t">${_esc(name)}</span><button type="button" class="rv-compare-rm" data-guid="${_esc(g)}" title="Remove">×</button></span>`;
+      })
+      .join('');
+    if (openBtn) {
+      openBtn.disabled = guids.length < 2;
+      openBtn.title = guids.length < 2 ? 'Select at least 2 notes' : 'Open compare view';
+    }
+  }
+
+  _renderDuplicatePlaceholder(el) {
+    const results = el.querySelector('.rv-results');
+    if (!results) return;
+    results.innerHTML = `<div class="rv-empty"><span class="ti ti-copy"></span><div>Duplicate analysis</div><div class="rv-empty-sub">Choose a kind and threshold, then Run analysis</div></div>`;
+  }
+
+  _renderCompareMain(el) {
+    if (this._compareDiffOpen) {
+      this._renderCompareDiff(el);
+      return;
+    }
+    if (this._panelMode !== 'compare') return;
+    const results = el.querySelector('.rv-results');
+    if (!results) return;
+    if (!this._matchRecords?.length) {
+      results.innerHTML = `<div class="rv-empty"><span class="ti ti-columns"></span><div>No results to compare</div><div class="rv-empty-sub">Switch to Search, run a query, then return here and use + on cards</div></div>`;
+      return;
+    }
+    const filterRaw = el.querySelector('.rv-compare-filter')?.value ?? '';
+    const { filtered: visible, totalBeforeFilter } = _filterRecordsForCompareDisplay(
+      this._matchRecords,
+      filterRaw,
+      this._recordColMap
+    );
+    if (!visible.length) {
+      results.innerHTML = `<div class="rv-empty"><span class="ti ti-search-off"></span><div>No notes match filter</div><div class="rv-empty-sub">${totalBeforeFilter} hidden — clear Filter list</div></div>`;
+      return;
+    }
+    const sortMode = this._captureSortMode(el);
+    const total = visible.length;
+    const selectedGuids = new Set(
+      [...el.querySelectorAll('.rv-col-list input:checked')].map(cb => cb.dataset.colGuid)
+    );
+    this._pageStart = Math.min(this._pageStart, Math.max(0, total - 1));
+    const firstBatch = visible.slice(this._pageStart, this._pageStart + this._pageSize);
+    const hasFilter = String(filterRaw || '').trim().length > 0;
+    const toolbarOpts =
+      hasFilter && totalBeforeFilter > total ? { listFilterTotalBefore: totalBeforeFilter } : {};
+    Promise.all(firstBatch.map(r => this._buildCard(r, selectedGuids, false, { compareBtn: true }))).then(cards => {
+      const validCards = cards.filter(Boolean);
+      const toolbar = _resultsToolbarHtml(
+        this._pageStart,
+        firstBatch.length,
+        total,
+        this._pageSize,
+        this._isJournalResults,
+        sortMode,
+        toolbarOpts
+      );
+      results.innerHTML = toolbar + '<div class="rv-cards-list">' + validCards.join('') + '</div>';
+    });
+  }
+
+  async _runDuplicateAnalysis(el) {
+    const results = el.querySelector('.rv-results');
+    if (!results) return;
+    const kind = el.querySelector('.rv-dup-kind')?.value || 'title_similar';
+    const thrEl = el.querySelector('.rv-dup-threshold');
+    const threshold = thrEl ? parseInt(thrEl.value, 10) / 100 : 0.85;
+
+    results.innerHTML = `<div class="rv-loading"><span class="rv-spin ti ti-refresh"></span> Scanning…</div>`;
+
+    const records = await this._gatherRecordsForDuplicateScan(el);
+    if (records.length === 0) {
+      results.innerHTML = `<div class="rv-empty"><span class="ti ti-filter-off"></span><div>No records in selected collections</div></div>`;
+      this._dupGroups = null;
+      return;
+    }
+    if (records.length > DUPLICATE_SCAN_MAX_RECORDS) {
+      results.innerHTML = `<div class="rv-empty"><span class="ti ti-alert-triangle"></span><div>Too many records (${records.length})</div><div class="rv-empty-sub">Narrow collections (max ${DUPLICATE_SCAN_MAX_RECORDS})</div></div>`;
+      this._dupGroups = null;
+      return;
+    }
+
+    try {
+      let groups;
+      if (kind === 'title_exact') {
+        groups = _duplicateGroupsTitleExact(records);
+      } else if (kind === 'title_similar') {
+        const includeVariants = !!el.querySelector('.rv-dup-title-variant')?.checked;
+        groups = _duplicateGroupsTitleSimilar(records, threshold, includeVariants);
+      } else if (kind === 'content_exact') {
+        const withText = await _recordsWithBodyText(records);
+        groups = _duplicateGroupsContentExact(withText);
+      } else {
+        if (records.length > CONTENT_SIMILAR_MAX_RECORDS) {
+          results.innerHTML = `<div class="rv-empty"><span class="ti ti-alert-triangle"></span><div>Too many records for similar-body scan (${records.length})</div><div class="rv-empty-sub">Narrow collections (max ${CONTENT_SIMILAR_MAX_RECORDS} for this mode)</div></div>`;
+          this._dupGroups = null;
+          return;
+        }
+        const withText = await _recordsWithBodyText(records);
+        groups = _duplicateGroupsContentSimilar(withText, threshold);
+      }
+      this._dupGroups = groups;
+      this._renderDuplicateResults(el, groups);
+    } catch (err) {
+      results.innerHTML = `<div class="rv-empty"><span class="ti ti-alert-triangle"></span><div>${_esc(err.message || String(err))}</div></div>`;
+      this._dupGroups = null;
+    }
+  }
+
+  async _gatherRecordsForDuplicateScan(el) {
+    const selectedGuids = new Set(
+      [...el.querySelectorAll('.rv-col-list input:checked')].map(cb => cb.dataset.colGuid)
+    );
+    const out = [];
+    for (const col of this._collections) {
+      if (!selectedGuids.has(col.getGuid())) continue;
+      let recs;
+      try {
+        recs = await col.getAllRecords();
+      } catch {
+        continue;
+      }
+      for (const r of recs) {
+        if (!r) continue;
+        if (this._isJournalCollectionRecord(r) && _isBlankLastModified(r)) continue;
+        out.push(r);
+      }
+    }
+    return out;
+  }
+
+  _renderDuplicateResults(el, groups) {
+    const results = el.querySelector('.rv-results');
+    if (!results) return;
+    if (!groups.length) {
+      results.innerHTML = `<div class="rv-empty"><span class="ti ti-check"></span><div>No duplicate groups found</div></div>`;
+      return;
+    }
+    const filterRaw = el.querySelector('.rv-dup-filter')?.value ?? '';
+    const { filtered, totalBeforeFilter } = _filterDupGroupsForDisplay(groups, filterRaw, this._recordColMap);
+    if (!filtered.length) {
+      results.innerHTML = `<div class="rv-empty"><span class="ti ti-search-off"></span><div>No groups match filter</div><div class="rv-empty-sub">${totalBeforeFilter} group(s) hidden — clear Filter groups</div></div>`;
+      return;
+    }
+    const totalNotes = filtered.reduce((s, g) => s + g.records.length, 0);
+    const selectedGuids = new Set(
+      [...el.querySelectorAll('.rv-col-list input:checked')].map(cb => cb.dataset.colGuid)
+    );
+    const hasFilter = String(filterRaw || '').trim().length > 0;
+    const countText = hasFilter
+      ? `${filtered.length} of ${totalBeforeFilter} groups · ${totalNotes} notes`
+      : `${filtered.length} groups · ${totalNotes} notes`;
+    const head = `<div class="rv-results-toolbar rv-results-toolbar--dup"><div class="rv-count-row"><span class="rv-count">${countText}</span></div></div>`;
+
+    const buildGroup = async g => {
+      const cards = await Promise.all(g.records.map(r => this._buildCard(r, selectedGuids, false, { compareBtn: true })));
+      const valid = cards.filter(Boolean);
+      return `<div class="rv-dup-group">
+  <div class="rv-dup-group-head">${_esc(g.label)} <span class="rv-dup-group-n">(${g.records.length})</span></div>
+  <div class="rv-cards-list">${valid.join('')}</div>
+</div>`;
+    };
+
+    Promise.all(filtered.map(buildGroup)).then(parts => {
+      results.innerHTML = head + `<div class="rv-dup-groups">${parts.join('')}</div>`;
+    });
+  }
+
+  _openCompareDiff(el) {
+    if (this._compareGuids.length < 2) return;
+    this._compareDiffOpen = true;
+    this._renderCompareDiff(el);
+  }
+
+  async _renderCompareDiff(el) {
+    const results = el.querySelector('.rv-results');
+    if (!results) return;
+    const guids = [...this._compareGuids].slice(0, 3);
+    const records = guids.map(g => this.data.getRecord(g)).filter(Boolean);
+    if (records.length < 2) {
+      this._compareDiffOpen = false;
+      this._renderCompareMain(el);
+      return;
+    }
+
+    const texts = await Promise.all(records.map(r => _extractRecordFullText(r)));
+    const titles = records.map(r => r.getName() || '(untitled)');
+
+    if (records.length === 2) {
+      const diff = _diffLines(texts[0], texts[1]);
+      results.innerHTML = _renderTwoPaneDiffHtml(titles[0], titles[1], diff, records[0].guid, records[1].guid);
+      return;
+    }
+
+    results.innerHTML = _renderTriplePaneHtml(titles, texts, records.map(r => r.guid));
+  }
+
+  async _compareActionOpen(el, searchPanel, guid) {
+    const record = this.data.getRecord(guid);
+    if (!record) return;
+    const newPanel = await this.ui.createPanel({ afterPanel: searchPanel });
+    if (newPanel) {
+      newPanel.navigateTo({
+        type: 'edit_panel',
+        rootId: record.guid,
+        subId: null,
+        workspaceGuid: this.getWorkspaceGuid(),
+      });
+    }
   }
 
   // ─── Search ───────────────────────────────────────────────────────────────
 
   async _runSearch(el) {
+    if (this._panelMode !== 'search') return;
     const sortMode = this._captureSortMode(el);
     const results = el.querySelector('.rv-results');
     results.innerHTML = `<div class="rv-loading"><span class="rv-spin ti ti-refresh"></span> Searching…</div>`;
@@ -645,7 +1099,7 @@ class Plugin extends AppPlugin {
       this._pageStart = 0;
       const total = filtered.length;
       const firstBatch = filtered.slice(0, this._pageSize);
-      const cards = await Promise.all(firstBatch.map(r => this._buildCard(r, selectedGuids, true)));
+      const cards = await Promise.all(firstBatch.map(r => this._buildCard(r, selectedGuids, true, { compareBtn: true })));
       const validCards = cards.filter(Boolean);
       const toolbar = _resultsToolbarHtml(this._pageStart, firstBatch.length, total, this._pageSize, true, sortMode);
       results.innerHTML = toolbar + '<div class="rv-cards-list">' + validCards.join('') + '</div>';
@@ -770,7 +1224,7 @@ class Plugin extends AppPlugin {
     this._pageStart = 0;
     const total = sorted.length;
     const firstBatch = sorted.slice(0, this._pageSize);
-    const cards = await Promise.all(firstBatch.map(r => this._buildCard(r, selectedGuids, false)));
+    const cards = await Promise.all(firstBatch.map(r => this._buildCard(r, selectedGuids, false, { compareBtn: true })));
     const validCards = cards.filter(Boolean);
     const toolbar = _resultsToolbarHtml(this._pageStart, firstBatch.length, total, this._pageSize, false, sortMode);
     results.innerHTML = toolbar + '<div class="rv-cards-list">' + validCards.join('') + '</div>';
@@ -778,8 +1232,9 @@ class Plugin extends AppPlugin {
 
   /**
    * @param {boolean} [expandPreview] - When true (journal date mode), card starts with preview expanded.
+   * @param {{ compareBtn?: boolean }} [opts]
    */
-  async _buildCard(record, selectedGuids, expandPreview = false) {
+  async _buildCard(record, selectedGuids, expandPreview = false, opts = {}) {
     // Fast O(1) lookup using pre-built map
     const meta = this._recordColMap[record.guid];
     const colName = meta ? meta.colName : '';
@@ -841,6 +1296,10 @@ class Plugin extends AppPlugin {
       ? `<span class="rv-card-time-sep"> · </span><span class="rv-card-time">${_esc(_fmtRel(updatedAt))}</span>`
       : '';
 
+    const compareBtn = opts.compareBtn
+      ? `<button type="button" class="rv-card-compare-add" data-record-guid="${record.guid}" title="Add to compare">+</button>`
+      : '';
+
     const openClass = expandPreview ? ' rv-card--preview-open' : '';
     return `
 <div class="rv-card has-expandable${openClass}" data-record-guid="${record.guid}">
@@ -854,6 +1313,7 @@ class Plugin extends AppPlugin {
         <span class="rv-card-title">${_esc(name)}</span><span class="rv-card-col-bracket"> [${_esc(_truncateDisplay(colName, COLLECTION_NAME_IN_CARD_MAX))}]</span>${timePart}
       </div>
     </div>
+    ${compareBtn}
   </div>
   <div class="rv-card-preview-inner">
     ${datesBlock}
@@ -865,6 +1325,29 @@ class Plugin extends AppPlugin {
 
   _bindCardActions(el, searchPanel) {
     el.querySelector('.rv-results').addEventListener('click', async e => {
+      if (e.target.closest('.rv-compare-back')) {
+        e.preventDefault();
+        this._compareDiffOpen = false;
+        if (this._panelMode === 'compare') await this._renderCompareMain(el);
+        return;
+      }
+      if (e.target.closest('.rv-compare-action-open')) {
+        e.stopPropagation();
+        const btn = e.target.closest('.rv-compare-action-open');
+        const guid = btn?.dataset.recordGuid;
+        if (guid) await this._compareActionOpen(el, searchPanel, guid);
+        return;
+      }
+      if (e.target.closest('.rv-card-compare-add')) {
+        e.stopPropagation();
+        const btn = e.target.closest('.rv-card-compare-add');
+        const guid = btn?.dataset.recordGuid;
+        if (guid && !this._compareGuids.includes(guid) && this._compareGuids.length < 3) {
+          this._compareGuids.push(guid);
+          this._syncCompareTray(el);
+        }
+        return;
+      }
       if (e.target.closest('.rv-load-prev')) {
         e.stopPropagation();
         await this._loadPrevPage(el);
@@ -884,7 +1367,8 @@ class Plugin extends AppPlugin {
           try {
             localStorage.setItem('rv_page_size_' + this.getWorkspaceGuid(), String(size));
           } catch { /* ignore */ }
-          await this._runSearch(el);
+          if (this._panelMode === 'compare') await this._renderCompareMain(el);
+          else await this._runSearch(el);
         }
         return;
       }
@@ -1146,8 +1630,12 @@ function _renderLoadMoreBar(hasPrev, hasNext) {
 }
 
 /** Toolbar: count, per-page (40/50/60), expand/collapse, sort (non-journal), load previous/next. */
-function _resultsToolbarHtml(pageStart, batchLen, total, pageSize, isJournal, sortMode = 'modified') {
-  const rangeText = _countRangeLabel(pageStart, batchLen, total, isJournal);
+function _resultsToolbarHtml(pageStart, batchLen, total, pageSize, isJournal, sortMode = 'modified', opts = {}) {
+  const { listFilterTotalBefore } = opts;
+  let rangeText = _countRangeLabel(pageStart, batchLen, total, isJournal);
+  if (listFilterTotalBefore != null && listFilterTotalBefore > total) {
+    rangeText += ` <span class="rv-filter-meta">(${listFilterTotalBefore} total before filter)</span>`;
+  }
   const sizes = [40, 50, 60].map(n =>
     `<button type="button" class="rv-link rv-page-size${n === pageSize ? ' rv-link--active' : ''}" data-size="${n}">${n}</button>`
   ).join('<span>·</span>');
@@ -1354,15 +1842,420 @@ function _propDisplayExpanded(prop, record) {
   } catch { return null; }
 }
 
+// ─── Duplicates & compare helpers ───────────────────────────────────────────
+
+class _UnionFind {
+  constructor(n) {
+    this.p = Array.from({ length: n }, (_, i) => i);
+  }
+  find(i) {
+    return this.p[i] === i ? i : (this.p[i] = this.find(this.p[i]));
+  }
+  union(a, b) {
+    const pa = this.find(a);
+    const pb = this.find(b);
+    if (pa !== pb) this.p[pa] = pb;
+  }
+}
+
+function _normalizeTitleForDup(s) {
+  return String(s || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+}
+
+function _lev(a, b) {
+  if (a === b) return 0;
+  const m = a.length;
+  const n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  const dp = new Array(n + 1);
+  for (let j = 0; j <= n; j++) dp[j] = j;
+  for (let i = 1; i <= m; i++) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const tmp = dp[j];
+      const cost = a.charCodeAt(i - 1) === b.charCodeAt(j - 1) ? 0 : 1;
+      dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + cost);
+      prev = tmp;
+    }
+  }
+  return dp[n];
+}
+
+function _titleSimilarity(a, b) {
+  const na = _normalizeTitleForDup(a);
+  const nb = _normalizeTitleForDup(b);
+  if (!na && !nb) return 1;
+  if (!na || !nb) return 0;
+  if (na === nb) return 1;
+  const d = _lev(na, nb);
+  const mx = Math.max(na.length, nb.length);
+  return mx ? 1 - d / mx : 1;
+}
+
+/** Jaccard similarity on whitespace-separated words (lowercased). */
+function _jaccardTitleWords(na, nb) {
+  const wa = na.split(/\s+/).filter(Boolean).map(w => w.toLowerCase());
+  const wb = nb.split(/\s+/).filter(Boolean).map(w => w.toLowerCase());
+  const setA = new Set(wa);
+  const setB = new Set(wb);
+  if (setA.size === 0 && setB.size === 0) return 1;
+  let inter = 0;
+  for (const w of setA) if (setB.has(w)) inter++;
+  const uni = setA.size + setB.size - inter;
+  return uni ? inter / uni : 0;
+}
+
+/** Longest common prefix length / max(length). */
+function _lcpTitleRatio(na, nb) {
+  const m = Math.min(na.length, nb.length);
+  let lcp = 0;
+  for (let i = 0; i < m; i++) {
+    if (na[i] === nb[i]) lcp++;
+    else break;
+  }
+  const mx = Math.max(na.length, nb.length);
+  return mx ? lcp / mx : 1;
+}
+
+/**
+ * 1 if one title’s words are a full prefix of the other’s (e.g. "A B" vs "A B Registration").
+ * Avoids substring traps like "9" vs "91" (word-by-word match only).
+ */
+function _titleWordPrefixVariantScore(na, nb) {
+  const a = na.split(/\s+/).filter(Boolean);
+  const b = nb.split(/\s+/).filter(Boolean);
+  if (!a.length || !b.length) return 0;
+  const [shorter, longer] = a.length <= b.length ? [a, b] : [b, a];
+  if (shorter.length > longer.length) return 0;
+  for (let i = 0; i < shorter.length; i++) {
+    if (shorter[i] !== longer[i]) return 0;
+  }
+  return shorter.length < longer.length ? 1 : 0;
+}
+
+/**
+ * Similar title score. When `includeVariants` is true, also considers word-prefix variants,
+ * token overlap, and common-prefix ratio (helps "Short title" vs "Short title Registration").
+ */
+function _titleSimilarityDup(a, b, includeVariants) {
+  const base = _titleSimilarity(a, b);
+  if (!includeVariants) return base;
+  const na = _normalizeTitleForDup(a);
+  const nb = _normalizeTitleForDup(b);
+  if (!na && !nb) return 1;
+  if (!na || !nb) return base;
+  if (na === nb) return 1;
+  const wp = _titleWordPrefixVariantScore(na, nb);
+  const jac = _jaccardTitleWords(na, nb);
+  const lcp = _lcpTitleRatio(na, nb);
+  return Math.max(base, wp, jac, lcp);
+}
+
+function _duplicateGroupsTitleExact(records) {
+  const map = new Map();
+  for (const r of records) {
+    let name = '';
+    try {
+      name = _normalizeTitleForDup(r.getName());
+    } catch { /* ignore */ }
+    if (!map.has(name)) map.set(name, []);
+    map.get(name).push(r);
+  }
+  const groups = [];
+  for (const recs of map.values()) {
+    if (recs.length < 2) continue;
+    let raw = '';
+    try {
+      raw = recs[0].getName() || '';
+    } catch { /* ignore */ }
+    const label = raw ? `Same titles: "${_truncateDisplay(raw, 56)}"` : 'Same titles (empty)';
+    groups.push({ label, records: recs });
+  }
+  groups.sort((a, b) => b.records.length - a.records.length);
+  return groups;
+}
+
+function _duplicateGroupsTitleSimilar(records, threshold, includeVariants = false) {
+  const n = records.length;
+  if (n < 2) return [];
+  const uf = new _UnionFind(n);
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      let na;
+      let nb;
+      try {
+        na = records[i].getName();
+        nb = records[j].getName();
+      } catch {
+        continue;
+      }
+      if (_titleSimilarityDup(na, nb, includeVariants) >= threshold) uf.union(i, j);
+    }
+  }
+  const buck = new Map();
+  for (let i = 0; i < n; i++) {
+    const r = uf.find(i);
+    if (!buck.has(r)) buck.set(r, []);
+    buck.get(r).push(records[i]);
+  }
+  const groups = [];
+  for (const g of buck.values()) {
+    if (g.length < 2) continue;
+    let rep = '';
+    try {
+      rep = g[0].getName() || '';
+    } catch { /* ignore */ }
+    const vTag = includeVariants ? ' · prefix/extra words' : '';
+    const label = `Similar titles (${Math.round(threshold * 100)}%+${vTag}): "${_truncateDisplay(rep, 48)}"`;
+    groups.push({ label, records: g });
+  }
+  groups.sort((a, b) => b.records.length - a.records.length);
+  return groups;
+}
+
+function _normalizeBodyForHash(s) {
+  return String(s || '').trim().replace(/\s+/g, ' ');
+}
+
+async function _extractRecordFullText(record) {
+  const chunks = [];
+  try {
+    const lines = await record.getLineItems(false);
+    const textLines = lines.filter(li =>
+      ['text', 'task', 'heading', 'quote'].includes(li.type) && li.segments?.length
+    );
+    for (const li of textLines) {
+      const t = li.segments
+        .filter(s => s.type === 'text' || s.type === 'bold' || s.type === 'italic')
+        .map(s => typeof s.text === 'string' ? s.text : '')
+        .join('')
+        .trim();
+      if (t) chunks.push(t);
+    }
+  } catch { /* skip */ }
+  return chunks.join('\n');
+}
+
+async function _recordsWithBodyText(records) {
+  const out = [];
+  for (const r of records) {
+    const body = await _extractRecordFullText(r);
+    out.push({ record: r, body });
+  }
+  return out;
+}
+
+function _hashStr(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return String(h >>> 0);
+}
+
+function _duplicateGroupsContentExact(withText) {
+  const map = new Map();
+  for (const { record, body } of withText) {
+    const k = _hashStr(_normalizeBodyForHash(body));
+    if (!map.has(k)) map.set(k, []);
+    map.get(k).push(record);
+  }
+  const groups = [];
+  for (const recs of map.values()) {
+    if (recs.length < 2) continue;
+    groups.push({ label: 'Same body text', records: recs });
+  }
+  groups.sort((a, b) => b.records.length - a.records.length);
+  return groups;
+}
+
+function _jaccardWords(a, b) {
+  const wa = new Set(String(a).toLowerCase().split(/\s+/).filter(w => w.length >= 2));
+  const wb = new Set(String(b).toLowerCase().split(/\s+/).filter(w => w.length >= 2));
+  if (wa.size === 0 && wb.size === 0) return 1;
+  let inter = 0;
+  for (const w of wa) if (wb.has(w)) inter++;
+  const uni = wa.size + wb.size - inter;
+  return uni ? inter / uni : 0;
+}
+
+function _duplicateGroupsContentSimilar(withText, threshold) {
+  const n = withText.length;
+  if (n < 2) return [];
+  const uf = new _UnionFind(n);
+  for (let i = 0; i < n; i++) {
+    const bi = withText[i].body;
+    for (let j = i + 1; j < n; j++) {
+      if (_jaccardWords(bi, withText[j].body) >= threshold) uf.union(i, j);
+    }
+  }
+  const buck = new Map();
+  for (let i = 0; i < n; i++) {
+    const r = uf.find(i);
+    if (!buck.has(r)) buck.set(r, []);
+    buck.get(r).push(withText[i].record);
+  }
+  const groups = [];
+  for (const g of buck.values()) {
+    if (g.length < 2) continue;
+    groups.push({
+      label: `Similar body (${Math.round(threshold * 100)}%+ word overlap)`,
+      records: g,
+    });
+  }
+  groups.sort((a, b) => b.records.length - a.records.length);
+  return groups;
+}
+
+function _diffLines(textA, textB) {
+  const a = String(textA || '').split('\n');
+  const b = String(textB || '').split('\n');
+  const m = a.length;
+  const n = b.length;
+  const dp = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (a[i - 1] === b[j - 1]) dp[i][j] = dp[i - 1][j - 1] + 1;
+      else dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+  const seq = [];
+  let i = m;
+  let j = n;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && a[i - 1] === b[j - 1]) {
+      seq.push({ t: 'both', left: a[i - 1], right: b[j - 1] });
+      i--;
+      j--;
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      seq.push({ t: 'right', left: '', right: b[j - 1] });
+      j--;
+    } else if (i > 0) {
+      seq.push({ t: 'left', left: a[i - 1], right: '' });
+      i--;
+    } else break;
+  }
+  seq.reverse();
+  return seq;
+}
+
+function _compareRecordActionsHtml(guid, fileName) {
+  const g = _esc(guid);
+  const raw = String(fileName ?? '').trim() || '(untitled)';
+  const name = _esc(_truncateDisplay(raw, 72));
+  const titleAttr = _esc(raw);
+  return `<div class="rv-compare-actions-block">
+  <span class="rv-compare-file-name" title="${titleAttr}">${name}</span>
+  <span class="rv-compare-col-actions">
+  <button type="button" class="rv-link rv-compare-action-open" data-record-guid="${g}" title="Open in a new panel">Open</button>
+</span>
+</div>`;
+}
+
+function _renderTwoPaneDiffHtml(titleA, titleB, seq, guidA, guidB) {
+  const rows = seq
+    .map(({ t, left, right }) => {
+      const cls = t === 'both' ? 'rv-diff-equal' : t === 'left' ? 'rv-diff-del' : 'rv-diff-add';
+      return `<div class="rv-diff-row ${cls}"><pre class="rv-diff-cell">${_esc(left)}</pre><pre class="rv-diff-cell">${_esc(right)}</pre></div>`;
+    })
+    .join('');
+  return `<div class="rv-compare-diff-wrap">
+  <div class="rv-compare-diff-header">
+    <button type="button" class="rv-link rv-compare-back">Back to list</button>
+    <span class="rv-compare-diff-titles"><span>${_esc(_truncateDisplay(titleA, 40))}</span><span class="rv-diff-vs">vs</span><span>${_esc(_truncateDisplay(titleB, 40))}</span></span>
+  </div>
+  <div class="rv-compare-col-actions-row">
+    <div class="rv-compare-col-actions-cell">${_compareRecordActionsHtml(guidA, titleA)}</div>
+    <div class="rv-compare-col-actions-cell">${_compareRecordActionsHtml(guidB, titleB)}</div>
+  </div>
+  <div class="rv-diff-grid">${rows}</div>
+</div>`;
+}
+
+function _renderTriplePaneHtml(titles, texts, guids) {
+  const cols = titles
+    .map((t, i) => {
+      const gid = guids[i] || '';
+      return `<div class="rv-diff-col"><div class="rv-diff-col-head">
+  ${gid ? _compareRecordActionsHtml(gid, t) : `<span class="rv-compare-file-name">${_esc(_truncateDisplay(t, 48))}</span>`}
+</div><pre class="rv-diff-col-body">${_esc(texts[i] || '')}</pre></div>`;
+    })
+    .join('');
+  return `<div class="rv-compare-diff-wrap rv-compare-diff-wrap--triple">
+  <div class="rv-compare-diff-header">
+    <button type="button" class="rv-link rv-compare-back">Back to list</button>
+    <span class="rv-compare-diff-hint">Three notes side by side</span>
+  </div>
+  <div class="rv-diff-triple">${cols}</div>
+</div>`;
+}
+
+/**
+ * Client-side filter for duplicate-result groups (case-insensitive substring).
+ * Matches group label, any record title, or collection name from `recordColMap`.
+ * @returns {{ filtered: { label: string, records: object[] }[], totalBeforeFilter: number }}
+ */
+function _filterDupGroupsForDisplay(groups, filterText, recordColMap) {
+  const totalBeforeFilter = groups.length;
+  const n = String(filterText || '').trim().toLowerCase();
+  if (!n) return { filtered: groups, totalBeforeFilter };
+  const filtered = groups.filter(g => {
+    if (String(g.label || '').toLowerCase().includes(n)) return true;
+    for (const r of g.records) {
+      try {
+        if (String(r.getName() || '').toLowerCase().includes(n)) return true;
+      } catch { /* ignore */ }
+      const m = recordColMap?.[r.guid];
+      if (m && String(m.colName || '').toLowerCase().includes(n)) return true;
+    }
+    return false;
+  });
+  return { filtered, totalBeforeFilter };
+}
+
+/**
+ * Client-side filter for compare-mode result list (case-insensitive substring).
+ * Matches note title or collection name from `recordColMap`.
+ * @returns {{ filtered: object[], totalBeforeFilter: number }}
+ */
+function _filterRecordsForCompareDisplay(records, filterText, recordColMap) {
+  const totalBeforeFilter = records.length;
+  const n = String(filterText || '').trim().toLowerCase();
+  if (!n) return { filtered: records, totalBeforeFilter };
+  const filtered = records.filter(r => {
+    try {
+      if (String(r.getName() || '').toLowerCase().includes(n)) return true;
+    } catch { /* ignore */ }
+    const m = recordColMap?.[r.guid];
+    if (m && String(m.colName || '').toLowerCase().includes(n)) return true;
+    return false;
+  });
+  return { filtered, totalBeforeFilter };
+}
+
 // ─── Static HTML ─────────────────────────────────────────────────────────────
 
 const SHELL_HTML = `
 <div class="rv-root">
 
-  <div class="rv-sidebar">
+  <div class="rv-sidebar rv-sidebar--mode-search">
     <div class="rv-sidebar-title">
-      <span class="ti ti-filter"></span> Filters
+      <span class="ti ti-filter"></span> Enhanced Search
     </div>
+
+    <div class="rv-mode-bar">
+      <button type="button" class="rv-mode-btn rv-mode-btn--active" data-mode="search">Search</button>
+      <button type="button" class="rv-mode-btn" data-mode="duplicates">Duplicates</button>
+      <button type="button" class="rv-mode-btn" data-mode="compare">Compare</button>
+    </div>
+
+    <div class="rv-block rv-block-search">
 
     <div class="rv-section">
       <div class="rv-section-label">
@@ -1420,6 +2313,58 @@ const SHELL_HTML = `
         <input class="rv-preset-name" type="text" placeholder="Name this filter set…">
         <button class="rv-preset-save" title="Save preset"><span class="ti ti-device-floppy"></span></button>
         <button class="rv-preset-edit-toggle" title="Manage presets"><span class="ti ti-trash"></span></button>
+      </div>
+    </div>
+
+    </div>
+
+    <div class="rv-block rv-block-dup">
+      <div class="rv-section">
+        <div class="rv-section-label">Duplicate analysis</div>
+        <select class="rv-dup-kind" title="What to compare">
+          <option value="title_exact">Exact titles</option>
+          <option value="title_similar" selected>Similar titles</option>
+          <option value="content_exact">Exact body</option>
+          <option value="content_similar">Similar body</option>
+        </select>
+        <div class="rv-dup-threshold-wrap">
+          <div class="rv-dup-threshold-label">Similarity <span class="rv-dup-threshold-val">85%</span></div>
+          <input type="range" min="70" max="100" value="85" class="rv-dup-threshold" title="Similarity threshold">
+        </div>
+        <label class="rv-dup-title-variant-wrap">
+          <input type="checkbox" class="rv-dup-title-variant" checked>
+          <span>Include prefix &amp; extra words (suffix variants)</span>
+        </label>
+        <button type="button" class="rv-dup-run">Run analysis</button>
+        <div class="rv-dup-filter-wrap">
+          <div class="rv-dup-filter-label">Filter groups</div>
+          <input type="text" class="rv-dup-filter" placeholder="Title, label, or collection…" autocomplete="off" title="Shows groups that match this text anywhere in the group label, a note title, or collection name">
+        </div>
+      </div>
+      <div class="rv-section">
+        <div class="rv-section-label">Presets</div>
+        <div class="rv-dup-preset-list"></div>
+        <div class="rv-dup-preset-save-row">
+          <input class="rv-dup-preset-name" type="text" placeholder="Name this duplicate preset…" autocomplete="off">
+          <button type="button" class="rv-dup-preset-save" title="Save preset"><span class="ti ti-device-floppy"></span></button>
+          <button type="button" class="rv-dup-preset-edit-toggle" title="Manage presets"><span class="ti ti-trash"></span></button>
+        </div>
+      </div>
+    </div>
+
+    <div class="rv-block rv-block-compare">
+      <div class="rv-section">
+        <div class="rv-section-label">Compare notes</div>
+        <div class="rv-compare-tray"></div>
+        <div class="rv-compare-actions">
+          <button type="button" class="rv-link rv-compare-clear">Clear</button>
+          <button type="button" class="rv-compare-open" disabled>Open compare</button>
+        </div>
+        <div class="rv-compare-filter-wrap">
+          <div class="rv-compare-filter-label">Filter list</div>
+          <input type="text" class="rv-compare-filter" placeholder="Title or collection…" autocomplete="off" title="Shows notes whose title or collection name contains this text">
+        </div>
+        <div class="rv-compare-hint">+ on cards adds here (max 3). Search in Search mode first.</div>
       </div>
     </div>
 
@@ -1999,11 +2944,14 @@ const CSS = `
   justify-content: center;
 }
 
-/* ── Presets ── */
-.rv-preset-list { display: flex; flex-direction: column; gap: 3px; margin-bottom: 7px; }
+/* ── Presets (search + duplicates) ── */
+.rv-preset-list,
+.rv-dup-preset-list { display: flex; flex-direction: column; gap: 3px; margin-bottom: 7px; }
 .rv-preset-empty { font-size: 11px; opacity: 0.35; padding: 2px 0; }
-.rv-preset-row { display: flex; align-items: center; gap: 5px; }
-.rv-preset-load {
+.rv-preset-row,
+.rv-dup-preset-row { display: flex; align-items: center; gap: 5px; }
+.rv-preset-load,
+.rv-dup-preset-load {
   flex: 1;
   text-align: left;
   background: rgba(128,128,128,0.08);
@@ -2018,8 +2966,10 @@ const CSS = `
   text-overflow: ellipsis;
   transition: background 0.12s;
 }
-.rv-preset-load:hover { background: rgba(128,128,128,0.18); border-color: rgba(128,128,128,0.35); }
-.rv-preset-name-label {
+.rv-preset-load:hover,
+.rv-dup-preset-load:hover { background: rgba(128,128,128,0.18); border-color: rgba(128,128,128,0.35); }
+.rv-preset-name-label,
+.rv-dup-preset-name-label {
   flex: 1;
   font-size: 12px;
   opacity: 0.7;
@@ -2027,7 +2977,8 @@ const CSS = `
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.rv-preset-del {
+.rv-preset-del,
+.rv-dup-preset-del {
   flex-shrink: 0;
   width: 24px;
   height: 24px;
@@ -2043,9 +2994,12 @@ const CSS = `
   opacity: 0.5;
   transition: opacity 0.1s, background 0.1s;
 }
-.rv-preset-del:hover { opacity: 1; background: rgba(220,50,50,0.2); }
-.rv-preset-save-row { display: flex; gap: 5px; align-items: center; }
-.rv-preset-edit-toggle {
+.rv-preset-del:hover,
+.rv-dup-preset-del:hover { opacity: 1; background: rgba(220,50,50,0.2); }
+.rv-preset-save-row,
+.rv-dup-preset-save-row { display: flex; gap: 5px; align-items: center; }
+.rv-preset-edit-toggle,
+.rv-dup-preset-edit-toggle {
   flex-shrink: 0;
   width: 28px;
   height: 28px;
@@ -2061,8 +3015,10 @@ const CSS = `
   opacity: 0.45;
   transition: opacity 0.1s, background 0.1s;
 }
-.rv-preset-edit-toggle:hover { opacity: 1; background: rgba(220,50,50,0.12); }
-.rv-preset-name {
+.rv-preset-edit-toggle:hover,
+.rv-dup-preset-edit-toggle:hover { opacity: 1; background: rgba(220,50,50,0.12); }
+.rv-preset-name,
+.rv-dup-preset-name {
   flex: 1;
   padding: 5px 8px;
   border-radius: 6px;
@@ -2073,8 +3029,10 @@ const CSS = `
   outline: none;
   min-width: 0;
 }
-.rv-preset-name:focus { border-color: var(--color-accent, #2563eb); }
-.rv-preset-save {
+.rv-preset-name:focus,
+.rv-dup-preset-name:focus { border-color: var(--color-accent, #2563eb); }
+.rv-preset-save,
+.rv-dup-preset-save {
   flex-shrink: 0;
   width: 28px;
   height: 28px;
@@ -2089,5 +3047,351 @@ const CSS = `
   font-size: 14px;
   transition: background 0.1s;
 }
-.rv-preset-save:hover { background: rgba(37,99,235,0.15); border-color: #2563eb; }
+.rv-preset-save:hover,
+.rv-dup-preset-save:hover { background: rgba(37,99,235,0.15); border-color: #2563eb; }
+
+/* ── Mode bar & duplicate / compare sidebar ── */
+.rv-mode-bar {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+.rv-mode-btn {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(128,128,128,0.22);
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.rv-mode-btn:hover { background: rgba(128,128,128,0.08); }
+.rv-mode-btn--active {
+  background: var(--color-accent, #2563eb);
+  border-color: var(--color-accent, #2563eb);
+  color: #fff;
+}
+.rv-sidebar--mode-search .rv-block-dup { display: none; }
+.rv-sidebar--mode-duplicates .rv-block-search { display: none; }
+.rv-sidebar--mode-compare .rv-block-search { display: none; }
+.rv-sidebar--mode-compare .rv-block-dup { display: none; }
+.rv-dup-kind {
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(128,128,128,0.22);
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.rv-dup-threshold-wrap { margin-bottom: 10px; }
+.rv-dup-title-variant-wrap {
+  display: none;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-size: 11px;
+  line-height: 1.35;
+  cursor: pointer;
+  opacity: 0.92;
+}
+.rv-dup-title-variant-wrap input {
+  margin: 2px 0 0 0;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.rv-dup-title-variant-wrap span { opacity: 0.88; }
+.rv-dup-threshold-label {
+  font-size: 10px;
+  opacity: 0.55;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.35px;
+}
+.rv-dup-threshold {
+  width: 100%;
+  accent-color: var(--color-accent, #2563eb);
+}
+.rv-dup-run {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: none;
+  background: var(--color-accent, #2563eb);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.rv-dup-run:hover { filter: brightness(1.08); }
+.rv-dup-filter-wrap,
+.rv-compare-filter-wrap { margin-top: 12px; }
+.rv-dup-filter-label,
+.rv-compare-filter-label {
+  font-size: 10px;
+  font-weight: 600;
+  opacity: 0.5;
+  text-transform: uppercase;
+  letter-spacing: 0.35px;
+  margin-bottom: 5px;
+}
+.rv-dup-filter,
+.rv-compare-filter {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(128,128,128,0.22);
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  outline: none;
+}
+.rv-dup-filter:focus,
+.rv-compare-filter:focus {
+  border-color: var(--color-accent, #2563eb);
+}
+.rv-results-toolbar .rv-filter-meta {
+  font-size: 11px;
+  font-weight: 500;
+  opacity: 0.55;
+}
+.rv-compare-tray {
+  min-height: 28px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 8px;
+}
+.rv-compare-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 6px 3px 8px;
+  border-radius: 5px;
+  background: rgba(128,128,128,0.12);
+  font-size: 11px;
+  max-width: 100%;
+}
+.rv-compare-chip-t {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 180px;
+}
+.rv-compare-rm {
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.55;
+  padding: 0 2px;
+  font-size: 14px;
+  line-height: 1;
+}
+.rv-compare-rm:hover { opacity: 1; }
+.rv-compare-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.rv-compare-open {
+  flex: 1;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(128,128,128,0.25);
+  background: rgba(128,128,128,0.08);
+  color: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.rv-compare-open:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.rv-compare-open:not(:disabled):hover {
+  border-color: var(--color-accent, #2563eb);
+  background: rgba(37,99,235,0.12);
+}
+.rv-compare-hint {
+  font-size: 10px;
+  opacity: 0.45;
+  line-height: 1.35;
+}
+.rv-card-compare-add {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  border: 1px solid rgba(128,128,128,0.25);
+  background: rgba(128,128,128,0.06);
+  cursor: pointer;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1;
+  color: inherit;
+  padding: 0;
+  align-self: flex-start;
+  margin-top: 1px;
+}
+.rv-card-compare-add:hover {
+  border-color: var(--color-accent, #2563eb);
+  background: rgba(37,99,235,0.12);
+}
+.rv-dup-groups { display: flex; flex-direction: column; gap: 16px; }
+.rv-dup-group-head {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  opacity: 0.85;
+}
+.rv-dup-group-n { opacity: 0.5; font-weight: 500; }
+.rv-results-toolbar--dup { margin-bottom: 12px; }
+
+/* ── Compare diff ── */
+.rv-compare-diff-wrap { display: flex; flex-direction: column; gap: 12px; min-height: 200px; }
+.rv-compare-diff-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  justify-content: space-between;
+}
+.rv-compare-diff-titles {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  opacity: 0.85;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  flex: 1;
+  min-width: 0;
+}
+.rv-diff-vs { opacity: 0.45; font-weight: 500; }
+.rv-compare-diff-hint { font-size: 11px; opacity: 0.55; }
+.rv-compare-col-actions-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  border: 1px solid rgba(128,128,128,0.2);
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  overflow: hidden;
+  margin-top: 4px;
+}
+.rv-compare-col-actions-cell {
+  padding: 6px 10px;
+  border-right: 1px solid rgba(128,128,128,0.15);
+  background: rgba(128,128,128,0.04);
+}
+.rv-compare-col-actions-cell:last-child { border-right: none; }
+.rv-compare-actions-block {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  justify-content: space-between;
+  width: 100%;
+}
+.rv-compare-file-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-right: 4px;
+}
+.rv-compare-col-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+  flex-shrink: 0;
+}
+.rv-compare-col-actions .rv-link { font-size: 11px; }
+.rv-compare-col-actions-row + .rv-diff-grid {
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+.rv-diff-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  border: 1px solid rgba(128,128,128,0.2);
+  border-radius: 8px;
+  overflow: hidden;
+  max-height: min(70vh, 720px);
+  overflow-y: auto;
+  font-size: 12px;
+}
+.rv-diff-row {
+  display: contents;
+}
+.rv-diff-cell {
+  margin: 0;
+  padding: 4px 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-bottom: 1px solid rgba(128,128,128,0.1);
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.rv-diff-equal .rv-diff-cell { background: rgba(128,128,128,0.04); }
+.rv-diff-del .rv-diff-cell:first-child { background: rgba(220,50,50,0.12); }
+.rv-diff-del .rv-diff-cell:last-child { background: rgba(128,128,128,0.04); }
+.rv-diff-add .rv-diff-cell:first-child { background: rgba(128,128,128,0.04); }
+.rv-diff-add .rv-diff-cell:last-child { background: rgba(34,197,94,0.12); }
+.rv-diff-triple {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  align-items: start;
+  max-height: min(70vh, 720px);
+  overflow: auto;
+}
+@media (max-width: 900px) {
+  .rv-diff-triple { grid-template-columns: 1fr; }
+}
+.rv-diff-col {
+  border: 1px solid rgba(128,128,128,0.2);
+  border-radius: 8px;
+  overflow: hidden;
+  min-width: 0;
+}
+.rv-diff-col-head {
+  padding: 6px 10px;
+  font-size: 11px;
+  border-bottom: 1px solid rgba(128,128,128,0.15);
+  background: rgba(128,128,128,0.06);
+}
+.rv-diff-col-head .rv-compare-actions-block {
+  width: 100%;
+}
+.rv-diff-col-body {
+  margin: 0;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 11px;
+  line-height: 1.45;
+  max-height: 60vh;
+  overflow-y: auto;
+}
 `;

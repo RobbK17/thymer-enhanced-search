@@ -1,10 +1,10 @@
 {
   "ver": 1,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "name": "Enhanced Search",
   "icon": "filter",
   "item_name": "viewer",
-  "description": "Enhanced Search (v1.0.0): cross-collection record viewer with filters for text, hashtags, date, task status, and collections.",
+  "description": "Enhanced Search (v1.1.0): cross-collection search, duplicate/similar title & body analysis, compare/diff for 2–3 notes, and presets.",
   "show_sidebar_items": false,
   "show_cmdpal_items": true,
   "views": [],

@@ -1,10 +1,14 @@
 # Enhanced Search — Thymer Plugin
 
-**Version 1.0.0**
+**Version 1.1.0**
 
-Cross-collection record viewer with filters for text, hashtags, tagged dates, task status, and collections.
+Cross-collection record viewer with **Search**, **Duplicates**, and **Compare** modes: filters for text, hashtags, tagged dates, task status, and collections; duplicate and similar-title/body analysis; side-by-side compare and line diff; and presets for search and duplicate settings.
 
-## Features
+## Modes
+
+Use the **Search** / **Duplicates** / **Compare** buttons at the top of the sidebar. **Collections** at the bottom apply to all modes (which collections are included in searches, duplicate scans, and compare card lists).
+
+### Search
 
 - **Search** — Plain text plus `#hashtags` (Thymer’s normal search rules)
 - **Task status** — Chips such as All tasks, Done, Started, … (adds `@…` filters to the search)
@@ -13,10 +17,26 @@ Cross-collection record viewer with filters for text, hashtags, tagged dates, ta
 - **Journal date** — Picks a **calendar day** and shows journal pages for that day (separate from search; see below)
 - **Collections** — Limit which collections are searched
 - **Sort** — **Modified (newest first)** (default), **Title (A–Z)**, or **Collection, then modified**; applies to normal search (mixed journal + other collections). Choice is remembered per workspace and stored in presets.
-- **Presets** — Save and reload combinations of the above
+- **Presets** — Save and reload combinations of search filters (search text, status, tagged date, journal date, collections, include #types, sort)
 - **Open a result** — Click a card to open the record in a panel
 
-## How the options work together
+### Duplicates
+
+- **Duplicate analysis** — Choose what to compare: **Exact titles**, **Similar titles**, **Exact body**, or **Similar body** (default: Similar titles).
+- **Similarity** — Slider (70–100%) for similar-title and similar-body modes.
+- **Include prefix & extra words (suffix variants)** — For similar titles only; helps group titles that differ by prefix/suffix wording.
+- **Run analysis** — Scans notes in the **selected collections** (subject to Thymer limits for very large workspaces).
+- **Filter groups** — After results appear, narrow groups by substring match on group label, note title, or collection name.
+- **Presets** — Save and reload duplicate settings: kind, threshold, prefix option, filter text, and **collections** selection. Loading a preset switches to Duplicates mode and runs analysis.
+
+### Compare
+
+- Run a query in **Search** first so the main area has a result list.
+- Switch to **Compare** and use **+** on cards to add up to **three** notes to the tray; **Open compare** opens a diff or three-column view.
+- **Filter list** — Narrows which notes appear in the compare card list (matches note title or collection name); does not change the underlying search results.
+- **Clear** empties the tray; **Back to list** returns from the compare view.
+
+## How the options work together (Search)
 
 **Normal search (search box + status + tagged date + collections)**  
 Everything you set is turned into **one query** for Thymer:
