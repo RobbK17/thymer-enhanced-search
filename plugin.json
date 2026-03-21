@@ -1,0 +1,22 @@
+{
+  "ver": 1,
+  "version": "1.0.0",
+  "name": "Enhanced Search",
+  "icon": "filter",
+  "item_name": "viewer",
+  "description": "Enhanced Search (v1.0.0): cross-collection record viewer with filters for text, hashtags, date, task status, and collections.",
+  "show_sidebar_items": false,
+  "show_cmdpal_items": true,
+  "views": [],
+  "fields": [],
+  "page_field_ids": [],
+  "sidebar_record_sort_field_id": "",
+  "sidebar_record_sort_dir": "asc",
+  "managed": {
+    "fields": false,
+    "views": false,
+    "sidebar": false
+  },
+  "custom": {},
+  "home": false
+}
