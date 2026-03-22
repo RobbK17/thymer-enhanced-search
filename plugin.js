@@ -1,15 +1,44 @@
 /**
- * Enhanced Search — Thymer plugin v1.1.0
+ * Enhanced Search — Thymer plugin v1.1.5
  * Cross-collection record viewer with filters (see README).
  * Modes: Search, Duplicates (analysis), Compare (2–3 notes + diff).
  */
 const PLUGIN_NAME = 'Enhanced Search';
-const PLUGIN_VERSION = '1.1.0';
+const PLUGIN_VERSION = '1.1.5';
 
 /** Skip duplicate/similar scans above this many records (per selected collections). */
 const DUPLICATE_SCAN_MAX_RECORDS = 2500;
 /** Max records for pairwise similar-body scan (performance). */
 const CONTENT_SIMILAR_MAX_RECORDS = 500;
+/** Max chars per property value in duplicate body + properties string. */
+const DUP_PROP_MAX_PER_FIELD = 800;
+/** Max total chars for the properties blob appended to body for duplicate analysis. */
+const DUP_PROP_MAX_TOTAL = 8000;
+
+/**
+ * Calendar days for journal range, anchored on selected date (local midnight).
+ * span3: 1 day before + selected + 2 days after (4 days).
+ * span7: 1 day before + selected + 6 days after (8 days).
+ */
+function _journalDaysForRange(anchor, range) {
+  const d0 = new Date(anchor);
+  d0.setHours(0, 0, 0, 0);
+  if (range === 'span3') {
+    return [-1, 0, 1, 2].map(off => {
+      const d = new Date(d0);
+      d.setDate(d.getDate() + off);
+      return d;
+    });
+  }
+  if (range === 'span7') {
+    return [-1, 0, 1, 2, 3, 4, 5, 6].map(off => {
+      const d = new Date(d0);
+      d.setDate(d.getDate() + off);
+      return d;
+    });
+  }
+  return [d0];
+}
 
 class Plugin extends AppPlugin {
   /** Enhanced Search viewer panels by `panel.getId()` (refs from getPanels() may differ from register callback). */
@@ -28,10 +57,14 @@ class Plugin extends AppPlugin {
   _panelMode = 'search';
   /** @type {{ label: string, records: object[] }[]|null} */
   _dupGroups = null;
+  /** Keys from `_dupGroupKey` for groups hidden via Dismiss in the duplicate results pane. */
+  _dupDismissedKeys = new Set();
   /** Up to 3 record GUIDs selected for compare */
   _compareGuids = [];
   /** True when main area shows diff / triple view instead of cards */
   _compareDiffOpen = false;
+  /** Which sidebar mode was active when **Open compare** was used (`search` | `duplicates` | `compare`) — drives Back label and navigation. */
+  _compareBackFrom = 'compare';
 
   // ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -274,6 +307,27 @@ class Plugin extends AppPlugin {
     return out;
   }
 
+  /**
+   * When the search box contains `@collection=…`, turn on only the sidebar checkboxes whose
+   * collection names match parsed names (case-insensitive). No-op if nothing parses or nothing matches.
+   */
+  _syncCollectionCheckboxesFromQuery(el, raw) {
+    if (!_searchStringUsesThymerCollectionScope(raw)) return;
+    const names = _parseThymerCollectionNamesFromSearch(raw);
+    if (!names.length) return;
+    const want = new Set(names.map(n => String(n).trim().toLowerCase()));
+    const matchedGuids = new Set();
+    for (const col of this._collections) {
+      const cn = String(col.getName() || '').trim().toLowerCase();
+      if (want.has(cn)) matchedGuids.add(col.getGuid());
+    }
+    if (matchedGuids.size === 0) return;
+    el.querySelectorAll('.rv-col-list input').forEach(cb => {
+      cb.checked = matchedGuids.has(cb.dataset.colGuid);
+    });
+    this._updateTypeSearchCheckboxVisibility(el);
+  }
+
   /** Show #type search checkbox only when a selected collection has a Type field. */
   _updateTypeSearchCheckboxVisibility(el) {
     const wrap = el.querySelector('.rv-search-include-type-wrap');
@@ -300,26 +354,94 @@ class Plugin extends AppPlugin {
       await this._renderCompareMain(el);
       return;
     }
+    if (this._panelMode === 'search') {
+      await this._renderSearchPageFromMatchRecords(el);
+    }
+  }
+
+  /** Client-side filter on current match list (title or collection substring). */
+  _getSearchFilteredRecords(el) {
+    const raw = el.querySelector('.rv-search-results-filter')?.value ?? '';
+    return _filterRecordsForCompareDisplay(this._matchRecords || [], raw, this._recordColMap);
+  }
+
+  async _copyResultListToClipboard(el) {
+    let records;
+    if (this._panelMode === 'compare') {
+      const filterRaw = el.querySelector('.rv-compare-filter')?.value ?? '';
+      records = _filterRecordsForCompareDisplay(
+        this._matchRecords || [],
+        filterRaw,
+        this._recordColMap
+      ).filtered;
+    } else if (this._panelMode === 'search') {
+      records = this._getSearchFilteredRecords(el).filtered;
+    } else {
+      return;
+    }
+    if (!records.length) return;
+    const text = _formatRecordListForClipboard(records, this._recordColMap);
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      } catch { /* ignore */ }
+    }
+  }
+
+  async _renderSearchPageFromMatchRecords(el) {
+    if (this._panelMode !== 'search') return;
+    const sortMode = this._captureSortMode(el);
+    const results = el.querySelector('.rv-results');
+    if (!results) return;
     const list = this._matchRecords;
-    if (!list || !list.length) return;
-    const total = list.length;
+    if (!list?.length) return;
     const selectedGuids = new Set(
       [...el.querySelectorAll('.rv-col-list input:checked')].map(cb => cb.dataset.colGuid)
     );
-    const batch = list.slice(this._pageStart, this._pageStart + this._pageSize);
-    const cards = await Promise.all(batch.map(r => this._buildCard(r, selectedGuids, this._isJournalResults, { compareBtn: true })));
-    const html = cards.filter(Boolean).join('');
-    const container = el.querySelector('.rv-cards-list');
-    if (container) container.innerHTML = html;
-    const countEl = el.querySelector('.rv-results-toolbar .rv-count');
-    if (countEl) {
-      countEl.textContent = _countRangeLabel(this._pageStart, batch.length, total, this._isJournalResults);
+    const filterRaw = el.querySelector('.rv-search-results-filter')?.value ?? '';
+    const { filtered: visible, totalBeforeFilter } = _filterRecordsForCompareDisplay(
+      list,
+      filterRaw,
+      this._recordColMap
+    );
+    if (!visible.length) {
+      if (totalBeforeFilter > 0) {
+        results.innerHTML = `<div class="rv-empty"><span class="ti ti-search-off"></span><div>No notes match filter</div><div class="rv-empty-sub">${totalBeforeFilter} hidden — clear Filter results</div></div>`;
+      }
+      return;
     }
-    const hasPrev = this._pageStart > 0;
-    const end = this._pageStart + batch.length;
-    const hasNext = end < total;
-    const loadBar = el.querySelector('.rv-load-more-bar');
-    if (loadBar) loadBar.outerHTML = _renderLoadMoreBar(hasPrev, hasNext);
+    const isJournal = this._isJournalResults;
+    const expandPreview = isJournal;
+    this._pageStart = Math.min(this._pageStart, Math.max(0, visible.length - 1));
+    const total = visible.length;
+    const firstBatch = visible.slice(this._pageStart, this._pageStart + this._pageSize);
+    const hasFilter = String(filterRaw || '').trim().length > 0;
+    const toolbarOpts =
+      hasFilter && totalBeforeFilter > total ? { listFilterTotalBefore: totalBeforeFilter } : {};
+    const cards = await Promise.all(
+      firstBatch.map(r => this._buildCard(r, selectedGuids, expandPreview, { compareBtn: true }))
+    );
+    const validCards = cards.filter(Boolean);
+    const toolbar = _resultsToolbarHtml(
+      this._pageStart,
+      firstBatch.length,
+      total,
+      this._pageSize,
+      isJournal,
+      sortMode,
+      toolbarOpts
+    );
+    results.innerHTML = toolbar + '<div class="rv-cards-list">' + validCards.join('') + '</div>';
     const main = el.querySelector('.rv-main');
     if (main) main.scrollTop = 0;
   }
@@ -340,6 +462,9 @@ class Plugin extends AppPlugin {
         this._recordColMap
       );
       total = filtered.length;
+    } else if (this._panelMode === 'search') {
+      const { filtered } = this._getSearchFilteredRecords(el);
+      total = filtered.length;
     } else {
       const list = this._matchRecords;
       if (!list || !list.length) return;
@@ -356,14 +481,31 @@ class Plugin extends AppPlugin {
 
 
   _journalDate = null; // Date object or null
+  /** `single` | `span3` (1 day before + selected + 2 after) | `span7` (1 before + selected + 6 after). */
+  _journalRange = 'single';
 
   // ─── Journal Date ─────────────────────────────────────────────────────────
+
+  _readJournalRange(el) {
+    const v = el.querySelector('input.rv-journal-range:checked')?.value;
+    if (v === 'span3' || v === 'span7') return v;
+    return 'single';
+  }
+
+  _syncJournalRangeRadios(el, range) {
+    const r = range === 'span3' || range === 'span7' ? range : 'single';
+    this._journalRange = r;
+    el.querySelectorAll('input.rv-journal-range').forEach(inp => {
+      inp.checked = inp.value === r;
+    });
+  }
 
   _setJournalDate(date, el) {
     this._journalDate = date;
     const label = el.querySelector('.rv-journal-label');
     if (!date) {
       label.textContent = '—';
+      this._syncJournalRangeRadios(el, 'single');
     } else {
       label.textContent = date.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
     }
@@ -372,6 +514,25 @@ class Plugin extends AppPlugin {
     this._runSearch(el);
   }
 
+  /**
+   * Only one of tagged date (@…), task status, or journal-day mode may be active.
+   * Clears the two areas not listed in `keep`. Does not run search.
+   * @param {'tagged'|'journal'|'status'} keep
+   */
+  _clearSiblingDateFilters(el, keep) {
+    if (keep !== 'tagged') {
+      el.querySelectorAll('.rv-date-bar .rv-chip').forEach(c => c.classList.remove('rv-chip--active'));
+    }
+    if (keep !== 'status') {
+      el.querySelectorAll('.rv-status-bar .rv-chip').forEach(c => c.classList.remove('rv-chip--active'));
+    }
+    if (keep !== 'journal') {
+      this._journalDate = null;
+      const jl = el.querySelector('.rv-journal-label');
+      if (jl) jl.textContent = '—';
+      el.querySelectorAll('.rv-jchip').forEach(c => c.classList.remove('rv-chip--active'));
+    }
+  }
 
   _presetsKey() { return 'rv_presets_' + this.getWorkspaceGuid(); }
 
@@ -403,6 +564,7 @@ class Plugin extends AppPlugin {
       kind: el.querySelector('.rv-dup-kind')?.value || 'title_similar',
       threshold: thrEl ? parseInt(thrEl.value, 10) : 85,
       titleVariant: !!el.querySelector('.rv-dup-title-variant')?.checked,
+      includeBodyProps: !!el.querySelector('.rv-dup-body-include-props')?.checked,
       dupFilter: el.querySelector('.rv-dup-filter')?.value ?? '',
       collections: [...el.querySelectorAll('.rv-col-list input:checked')].map(cb => cb.dataset.colGuid),
     };
@@ -423,6 +585,8 @@ class Plugin extends AppPlugin {
     }
     const tv = el.querySelector('.rv-dup-title-variant');
     if (tv) tv.checked = state.titleVariant !== false;
+    const bp = el.querySelector('.rv-dup-body-include-props');
+    if (bp) bp.checked = state.includeBodyProps === true;
     const df = el.querySelector('.rv-dup-filter');
     if (df) df.value = state.dupFilter != null ? String(state.dupFilter) : '';
     el.querySelectorAll('.rv-col-list input').forEach(cb => {
@@ -430,8 +594,7 @@ class Plugin extends AppPlugin {
     });
     this._updateTypeSearchCheckboxVisibility(el);
     this._syncDupKindUI(el);
-    this._setPanelMode(el, 'duplicates');
-    await this._runDuplicateAnalysis(el);
+    await this._setPanelMode(el, 'duplicates', { forceDup: true });
   }
 
   _getFilterState(el) {
@@ -441,8 +604,10 @@ class Plugin extends AppPlugin {
       date: el.querySelector('.rv-date-bar .rv-chip--active')?.dataset.date || '',
       collections: [...el.querySelectorAll('.rv-col-list input:checked')].map(cb => cb.dataset.colGuid),
       journalDate: this._journalDate ? this._journalDate.toISOString() : null,
+      journalRange: this._readJournalRange(el),
       includeTypeSearch: !!el.querySelector('.rv-search-include-type')?.checked,
       sort: this._captureSortMode(el),
+      searchResultsFilter: el.querySelector('.rv-search-results-filter')?.value ?? '',
     };
   }
 
@@ -465,8 +630,15 @@ class Plugin extends AppPlugin {
       this._journalDate = null;
       el.querySelector('.rv-journal-label').textContent = '—';
     }
+    if (state.journalRange === 'span3' || state.journalRange === 'span7') {
+      this._syncJournalRangeRadios(el, state.journalRange);
+    } else {
+      this._syncJournalRangeRadios(el, 'single');
+    }
     const typeCb = el.querySelector('.rv-search-include-type');
     if (typeCb) typeCb.checked = !!state.includeTypeSearch;
+    const srf = el.querySelector('.rv-search-results-filter');
+    if (srf) srf.value = state.searchResultsFilter != null ? String(state.searchResultsFilter) : '';
     if (state.sort && ['modified', 'title', 'collection_modified'].includes(state.sort)) {
       try { localStorage.setItem(this._sortStorageKey(), state.sort); } catch { /* ignore */ }
     }
@@ -555,21 +727,33 @@ class Plugin extends AppPlugin {
       searchInput.focus();
     });
 
-    // Status chips — toggle
+    // Status chips — toggle (exclusive with tagged date + journal day mode)
     el.querySelector('.rv-status-bar').addEventListener('click', e => {
       const chip = e.target.closest('.rv-chip');
       if (!chip) return;
+      this._clearSiblingDateFilters(el, 'status');
       chip.classList.toggle('rv-chip--active');
       this._runSearch(el);
     });
 
-    // Date chips — single select
+    // Tagged date chips — single select (exclusive with task status + journal day mode)
     el.querySelector('.rv-date-bar').addEventListener('click', e => {
       const chip = e.target.closest('.rv-chip');
       if (!chip) return;
+      this._clearSiblingDateFilters(el, 'tagged');
       const wasActive = chip.classList.contains('rv-chip--active');
       el.querySelectorAll('.rv-date-bar .rv-chip').forEach(c => c.classList.remove('rv-chip--active'));
       if (!wasActive) chip.classList.add('rv-chip--active');
+      this._runSearch(el);
+    });
+
+    el.querySelector('.rv-tagged-date-clear')?.addEventListener('click', () => {
+      el.querySelectorAll('.rv-date-bar .rv-chip').forEach(c => c.classList.remove('rv-chip--active'));
+      this._runSearch(el);
+    });
+
+    el.querySelector('.rv-task-status-clear')?.addEventListener('click', () => {
+      el.querySelectorAll('.rv-status-bar .rv-chip').forEach(c => c.classList.remove('rv-chip--active'));
       this._runSearch(el);
     });
 
@@ -599,6 +783,13 @@ class Plugin extends AppPlugin {
     });
 
     // Journal date nav
+    el.querySelectorAll('input.rv-journal-range').forEach(inp => {
+      inp.addEventListener('change', () => {
+        this._journalRange = this._readJournalRange(el);
+        if (this._journalDate) this._runSearch(el);
+      });
+    });
+
     el.querySelector('.rv-journal-date-bar').addEventListener('click', e => {
       const chip = e.target.closest('.rv-jchip');
       const prev = e.target.closest('.rv-journal-prev');
@@ -608,26 +799,33 @@ class Plugin extends AppPlugin {
         const val = chip.dataset.jdate;
         const base = this._journalDate || (() => { const d = new Date(); d.setHours(0,0,0,0); return d; })();
         if (val === 'today') {
-          const d = new Date(); d.setHours(0,0,0,0);
-          chip.classList.add('rv-chip--active');
-          this._journalDate = d;
-          el.querySelector('.rv-journal-label').textContent =
-            d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
-          this._runSearch(el);
+          this._clearSiblingDateFilters(el, 'journal');
+          const d = new Date();
+          d.setHours(0, 0, 0, 0);
+          this._setJournalDate(d, el);
+          el.querySelector('.rv-jchip[data-jdate="today"]')?.classList.add('rv-chip--active');
         } else if (val === 'lastwk') {
-          const d = new Date(base); d.setDate(d.getDate() - 7);
+          this._clearSiblingDateFilters(el, 'journal');
+          const d = new Date(base);
+          d.setDate(d.getDate() - 7);
           this._setJournalDate(d, el);
         } else if (val === 'nextwk') {
-          const d = new Date(base); d.setDate(d.getDate() + 7);
+          this._clearSiblingDateFilters(el, 'journal');
+          const d = new Date(base);
+          d.setDate(d.getDate() + 7);
           this._setJournalDate(d, el);
         }
       } else if (prev) {
-        const base = this._journalDate || (() => { const d = new Date(); d.setHours(0,0,0,0); return d; })();
-        const d = new Date(base); d.setDate(d.getDate() - 1);
+        this._clearSiblingDateFilters(el, 'journal');
+        const base = this._journalDate || (() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; })();
+        const d = new Date(base);
+        d.setDate(d.getDate() - 1);
         this._setJournalDate(d, el);
       } else if (next) {
-        const base = this._journalDate || (() => { const d = new Date(); d.setHours(0,0,0,0); return d; })();
-        const d = new Date(base); d.setDate(d.getDate() + 1);
+        this._clearSiblingDateFilters(el, 'journal');
+        const base = this._journalDate || (() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; })();
+        const d = new Date(base);
+        d.setDate(d.getDate() + 1);
         this._setJournalDate(d, el);
       }
     });
@@ -720,7 +918,12 @@ class Plugin extends AppPlugin {
       this._setPanelMode(el, btn.dataset.mode);
     });
 
-    el.querySelector('.rv-dup-run')?.addEventListener('click', () => this._runDuplicateAnalysis(el));
+    el.querySelector('.rv-dup-run')?.addEventListener('click', () => {
+      this._compareGuids = [];
+      this._compareDiffOpen = false;
+      this._syncCompareTray(el);
+      void this._runDuplicateAnalysis(el);
+    });
 
     el.querySelector('.rv-compare-open')?.addEventListener('click', () => this._openCompareDiff(el));
 
@@ -763,6 +966,17 @@ class Plugin extends AppPlugin {
         }
       }, 200);
     });
+
+    let searchResultsFilterDebounce = null;
+    el.querySelector('.rv-search-results-filter')?.addEventListener('input', () => {
+      clearTimeout(searchResultsFilterDebounce);
+      searchResultsFilterDebounce = setTimeout(() => {
+        if (this._panelMode === 'search' && this._matchRecords?.length) {
+          this._pageStart = 0;
+          void this._renderSearchPageFromMatchRecords(el);
+        }
+      }, 200);
+    });
   }
 
   _syncDupKindUI(el) {
@@ -771,20 +985,39 @@ class Plugin extends AppPlugin {
     if (tw) tw.style.display = k === 'title_similar' || k === 'content_similar' ? '' : 'none';
     const vw = el.querySelector('.rv-dup-title-variant-wrap');
     if (vw) vw.style.display = k === 'title_similar' ? 'flex' : 'none';
+    const bpw = el.querySelector('.rv-dup-body-props-wrap');
+    if (bpw) bpw.style.display = k === 'content_exact' || k === 'content_similar' ? 'flex' : 'none';
   }
 
-  _setPanelMode(el, mode) {
+  /**
+   * @param {object} [opts]
+   * @param {boolean} [opts.forceDup] — When switching to Duplicates, always run analysis (e.g. dup preset load).
+   */
+  async _setPanelMode(el, mode, opts = {}) {
     if (!['search', 'duplicates', 'compare'].includes(mode)) return;
-    this._panelMode = mode;
     this._compareDiffOpen = false;
+
+    if (mode === 'compare') {
+      await this._runSearch(el, { ignoreMode: true });
+      this._panelMode = 'compare';
+      this._applyPanelMode(el);
+      this._renderCompareMain(el);
+      return;
+    }
+
+    this._panelMode = mode;
     this._applyPanelMode(el);
     if (mode === 'search') {
-      this._runSearch(el);
+      await this._runSearch(el);
     } else if (mode === 'duplicates') {
+      const shouldDupRefresh = this._dupGroups != null;
+      this._dupDismissedKeys.clear();
       this._dupGroups = null;
-      this._renderDuplicatePlaceholder(el);
-    } else {
-      this._renderCompareMain(el);
+      if (opts.forceDup || shouldDupRefresh) {
+        await this._runDuplicateAnalysis(el);
+      } else {
+        this._renderDuplicatePlaceholder(el);
+      }
     }
   }
 
@@ -873,6 +1106,7 @@ class Plugin extends AppPlugin {
   async _runDuplicateAnalysis(el) {
     const results = el.querySelector('.rv-results');
     if (!results) return;
+    this._dupDismissedKeys.clear();
     const kind = el.querySelector('.rv-dup-kind')?.value || 'title_similar';
     const thrEl = el.querySelector('.rv-dup-threshold');
     const threshold = thrEl ? parseInt(thrEl.value, 10) / 100 : 0.85;
@@ -893,22 +1127,23 @@ class Plugin extends AppPlugin {
 
     try {
       let groups;
+      const includeBodyProps = !!el.querySelector('.rv-dup-body-include-props')?.checked;
       if (kind === 'title_exact') {
         groups = _duplicateGroupsTitleExact(records);
       } else if (kind === 'title_similar') {
         const includeVariants = !!el.querySelector('.rv-dup-title-variant')?.checked;
         groups = _duplicateGroupsTitleSimilar(records, threshold, includeVariants);
       } else if (kind === 'content_exact') {
-        const withText = await _recordsWithBodyText(records);
-        groups = _duplicateGroupsContentExact(withText);
+        const withText = await _recordsWithBodyText(records, includeBodyProps);
+        groups = _duplicateGroupsContentExact(withText, { includeProps: includeBodyProps });
       } else {
         if (records.length > CONTENT_SIMILAR_MAX_RECORDS) {
           results.innerHTML = `<div class="rv-empty"><span class="ti ti-alert-triangle"></span><div>Too many records for similar-body scan (${records.length})</div><div class="rv-empty-sub">Narrow collections (max ${CONTENT_SIMILAR_MAX_RECORDS} for this mode)</div></div>`;
           this._dupGroups = null;
           return;
         }
-        const withText = await _recordsWithBodyText(records);
-        groups = _duplicateGroupsContentSimilar(withText, threshold);
+        const withText = await _recordsWithBodyText(records, includeBodyProps);
+        groups = _duplicateGroupsContentSimilar(withText, threshold, { includeProps: includeBodyProps });
       }
       this._dupGroups = groups;
       this._renderDuplicateResults(el, groups);
@@ -947,8 +1182,18 @@ class Plugin extends AppPlugin {
       results.innerHTML = `<div class="rv-empty"><span class="ti ti-check"></span><div>No duplicate groups found</div></div>`;
       return;
     }
+    const groupsAfterDismiss = groups.filter(g => !this._dupDismissedKeys.has(_dupGroupKey(g)));
+    if (!groupsAfterDismiss.length) {
+      const n = this._dupDismissedKeys.size;
+      results.innerHTML = `<div class="rv-empty"><span class="ti ti-eye-off"></span><div>All groups hidden</div><div class="rv-empty-sub">${n} group(s) dismissed — <button type="button" class="rv-link rv-dup-reset-dismissed">Restore dismissed</button></div></div>`;
+      return;
+    }
     const filterRaw = el.querySelector('.rv-dup-filter')?.value ?? '';
-    const { filtered, totalBeforeFilter } = _filterDupGroupsForDisplay(groups, filterRaw, this._recordColMap);
+    const { filtered, totalBeforeFilter } = _filterDupGroupsForDisplay(
+      groupsAfterDismiss,
+      filterRaw,
+      this._recordColMap
+    );
     if (!filtered.length) {
       results.innerHTML = `<div class="rv-empty"><span class="ti ti-search-off"></span><div>No groups match filter</div><div class="rv-empty-sub">${totalBeforeFilter} group(s) hidden — clear Filter groups</div></div>`;
       return;
@@ -958,16 +1203,26 @@ class Plugin extends AppPlugin {
       [...el.querySelectorAll('.rv-col-list input:checked')].map(cb => cb.dataset.colGuid)
     );
     const hasFilter = String(filterRaw || '').trim().length > 0;
+    const nd = this._dupDismissedKeys.size;
     const countText = hasFilter
       ? `${filtered.length} of ${totalBeforeFilter} groups · ${totalNotes} notes`
       : `${filtered.length} groups · ${totalNotes} notes`;
-    const head = `<div class="rv-results-toolbar rv-results-toolbar--dup"><div class="rv-count-row"><span class="rv-count">${countText}</span></div></div>`;
+    const restoreDismissed =
+      nd > 0
+        ? `<span class="rv-col-actions"><span>·</span><button type="button" class="rv-link rv-dup-reset-dismissed" title="Show every dismissed group again">Restore dismissed (${nd})</button></span>`
+        : '';
+    const head = `<div class="rv-results-toolbar rv-results-toolbar--dup"><div class="rv-count-row"><span class="rv-count">${countText}</span>${restoreDismissed}</div></div>`;
 
     const buildGroup = async g => {
+      const key = _dupGroupKey(g);
+      const keyAttr = encodeURIComponent(key);
       const cards = await Promise.all(g.records.map(r => this._buildCard(r, selectedGuids, false, { compareBtn: true })));
       const valid = cards.filter(Boolean);
       return `<div class="rv-dup-group">
-  <div class="rv-dup-group-head">${_esc(g.label)} <span class="rv-dup-group-n">(${g.records.length})</span></div>
+  <div class="rv-dup-group-head">
+    <span class="rv-dup-group-head-main">${_esc(g.label)} <span class="rv-dup-group-n">(${g.records.length})</span></span>
+    <button type="button" class="rv-link rv-dup-dismiss" data-dup-key="${keyAttr}" title="Hide this group from the list">Dismiss</button>
+  </div>
   <div class="rv-cards-list">${valid.join('')}</div>
 </div>`;
     };
@@ -979,18 +1234,45 @@ class Plugin extends AppPlugin {
 
   _openCompareDiff(el) {
     if (this._compareGuids.length < 2) return;
+    this._compareBackFrom = ['search', 'duplicates', 'compare'].includes(this._panelMode)
+      ? this._panelMode
+      : 'compare';
     this._compareDiffOpen = true;
     this._renderCompareDiff(el);
+  }
+
+  _compareBackLabel() {
+    if (this._compareBackFrom === 'duplicates') return 'Back to duplicates';
+    if (this._compareBackFrom === 'search') return 'Back to search';
+    return 'Back to list';
+  }
+
+  async _goBackFromCompareDiff(el) {
+    this._compareDiffOpen = false;
+    this._compareGuids = [];
+    this._syncCompareTray(el);
+    const from = this._compareBackFrom;
+    if (from === 'duplicates') {
+      if (this._dupGroups?.length) this._renderDuplicateResults(el, this._dupGroups);
+      else this._renderDuplicatePlaceholder(el);
+      return;
+    }
+    if (from === 'search') {
+      await this._renderSearchPageFromMatchRecords(el);
+      return;
+    }
+    await this._renderCompareMain(el);
   }
 
   async _renderCompareDiff(el) {
     const results = el.querySelector('.rv-results');
     if (!results) return;
+    const backLabel = this._compareBackLabel();
     const guids = [...this._compareGuids].slice(0, 3);
     const records = guids.map(g => this.data.getRecord(g)).filter(Boolean);
     if (records.length < 2) {
       this._compareDiffOpen = false;
-      this._renderCompareMain(el);
+      await this._goBackFromCompareDiff(el);
       return;
     }
 
@@ -999,11 +1281,28 @@ class Plugin extends AppPlugin {
 
     if (records.length === 2) {
       const diff = _diffLines(texts[0], texts[1]);
-      results.innerHTML = _renderTwoPaneDiffHtml(titles[0], titles[1], diff, records[0].guid, records[1].guid);
+      const propsDiffHtml = _renderComparePropertiesTwoPaneKeyed(records[0], records[1], titles[0], titles[1]);
+      results.innerHTML = _renderTwoPaneDiffHtml(
+        titles[0],
+        titles[1],
+        diff,
+        records[0].guid,
+        records[1].guid,
+        backLabel,
+        propsDiffHtml
+      );
       return;
     }
 
-    results.innerHTML = _renderTriplePaneHtml(titles, texts, records.map(r => r.guid));
+    const propsHtml = _renderComparePropertiesThreePaneKeyed(
+      records[0],
+      records[1],
+      records[2],
+      titles[0],
+      titles[1],
+      titles[2]
+    );
+    results.innerHTML = _renderTriplePaneHtml(titles, texts, records.map(r => r.guid), backLabel, propsHtml);
   }
 
   async _compareActionOpen(el, searchPanel, guid) {
@@ -1022,17 +1321,78 @@ class Plugin extends AppPlugin {
 
   // ─── Search ───────────────────────────────────────────────────────────────
 
-  async _runSearch(el) {
-    if (this._panelMode !== 'search') return;
+  /**
+   * One-line summary under the mode bar + check icons on filter section labels.
+   * Reflects current sidebar state (text can combine with at most one of tagged / journal / status).
+   */
+  _updateActiveSearchIndicators(el) {
+    const sumEl = el.querySelector('.rv-active-filters-summary');
+    const setSectionIcon = (selector, active) => {
+      const icon = el.querySelector(`${selector} .rv-section-active-icon`);
+      if (!icon) return;
+      icon.classList.toggle('ti-check', active);
+      icon.classList.toggle('rv-section-active-icon--on', active);
+    };
+
+    const raw = el.querySelector('.rv-search-input')?.value?.trim() ?? '';
+    const hasText = raw.length > 0;
+    const taggedChip = el.querySelector('.rv-date-bar .rv-chip--active');
+    const hasTagged = !!taggedChip;
+    const hasJournal = !!this._journalDate;
+    const statusChips = el.querySelectorAll('.rv-status-bar .rv-chip--active');
+    const hasStatus = statusChips.length > 0;
+
+    setSectionIcon('.rv-section--filter-tagged', hasTagged);
+    setSectionIcon('.rv-section--filter-journal', hasJournal);
+    setSectionIcon('.rv-section--filter-status', hasStatus);
+    setSectionIcon('.rv-section--filter-search', hasText);
+
+    if (!sumEl) return;
+    const parts = [];
+    if (hasText) parts.push('Search text');
+    if (hasTagged) {
+      const label = taggedChip?.textContent?.trim() || 'Tagged date';
+      parts.push(`Tagged date (${label})`);
+    }
+    if (hasJournal) {
+      const d = this._journalDate;
+      const ds = d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+      const jr = this._readJournalRange(el);
+      const span =
+        jr === 'span3'
+          ? ', 3 days'
+          : jr === 'span7'
+            ? ', 7 days'
+            : ', 1 day';
+      parts.push(`Journal (${ds}${span})`);
+    }
+    if (hasStatus) {
+      const names = [...statusChips].map(c => c.textContent.trim()).filter(Boolean);
+      parts.push(`Task status (${names.join(', ')})`);
+    }
+    sumEl.textContent = parts.length === 0
+      ? 'Active: collections only (no text or date/status filters)'
+      : 'Active: ' + parts.join(' · ');
+  }
+
+  /**
+   * @param {{ ignoreMode?: boolean }} [opts] - If true, refresh `_matchRecords` only (no search result DOM); used when switching to Compare from any mode so the compare list uses up-to-date query results.
+   */
+  async _runSearch(el, opts = {}) {
+    if (!opts.ignoreMode && this._panelMode !== 'search') return;
+    this._updateActiveSearchIndicators(el);
     const sortMode = this._captureSortMode(el);
     const results = el.querySelector('.rv-results');
-    results.innerHTML = `<div class="rv-loading"><span class="rv-spin ti ti-refresh"></span> Searching…</div>`;
+    if (!opts.ignoreMode) {
+      results.innerHTML = `<div class="rv-loading"><span class="rv-spin ti ti-refresh"></span> Searching…</div>`;
+    }
 
     // Build query string
     const parts = [];
 
     const raw = el.querySelector('.rv-search-input').value.trim();
     const thymerCollectionScope = _searchStringUsesThymerCollectionScope(raw);
+    if (thymerCollectionScope) this._syncCollectionCheckboxesFromQuery(el, raw);
     // When @collection=… is in the box, Thymer scopes the search — don’t filter again by sidebar checkboxes.
     this._filterRecordsByCollectionCheckboxes = !thymerCollectionScope;
 
@@ -1065,44 +1425,60 @@ class Plugin extends AppPlugin {
     if (selectedGuids.size === 0) {
       if (!thymerCollectionScope || !raw.trim()) {
         this._matchRecords = [];
-        results.innerHTML = `<div class="rv-empty"><span class="ti ti-filter-off"></span><div>No collections selected</div></div>`;
+        if (!opts.ignoreMode) {
+          results.innerHTML = `<div class="rv-empty"><span class="ti ti-filter-off"></span><div>No collections selected</div></div>`;
+        }
         return;
       }
     }
 
     const query = parts.join(' ').trim();
 
-    // If journal date is active, find journal records for that date across selected collections
+    // If journal date is active, find journal records for that date (or range) across selected collections
     if (this._journalDate) {
       this._filterRecordsByCollectionCheckboxes = true;
+      this._journalRange = this._readJournalRange(el);
+      const range = this._journalRange;
+      const days = _journalDaysForRange(this._journalDate, range);
       const users = this.data.getActiveUsers();
       const journalCols = this._collections.filter(c =>
         c.isJournalPlugin() && selectedGuids.has(c.getGuid())
       );
-      const journalRecords = await Promise.all(
-        journalCols.flatMap(col =>
-          users.map(user => {
-            const d = this._journalDate;
-            const dt = DateTime.dateOnly(d.getFullYear(), d.getMonth(), d.getDate());
-            return col.getJournalRecord(user, dt);
-          })
-        )
+      const batches = await Promise.all(
+        days.map(dayDate => {
+          const dt = DateTime.dateOnly(dayDate.getFullYear(), dayDate.getMonth(), dayDate.getDate());
+          return Promise.all(
+            journalCols.flatMap(col =>
+              users.map(user => col.getJournalRecord(user, dt))
+            )
+          );
+        })
       );
-      const filtered = this._filterJournalDateRecords(journalRecords);
+      const seen = new Set();
+      const merged = [];
+      for (const batch of batches) {
+        for (const r of batch) {
+          if (!r || seen.has(r.guid)) continue;
+          seen.add(r.guid);
+          merged.push(r);
+        }
+      }
+      const filtered = this._filterJournalDateRecords(merged);
       if (filtered.length === 0) {
         this._matchRecords = [];
-        results.innerHTML = `<div class="rv-empty"><span class="ti ti-calendar-off"></span><div>No journal entry for this date</div></div>`;
+        if (!opts.ignoreMode) {
+          if (range === 'single') {
+            results.innerHTML = `<div class="rv-empty"><span class="ti ti-calendar-off"></span><div>No journal entry for this date</div></div>`;
+          } else {
+            results.innerHTML = `<div class="rv-empty"><span class="ti ti-calendar-off"></span><div>No journal entries for this date range</div><div class="rv-empty-sub">No entries in the selected ${range === 'span3' ? '3 days' : '7 days'} window</div></div>`;
+          }
+        }
         return;
       }
       this._matchRecords = filtered;
       this._isJournalResults = true;
       this._pageStart = 0;
-      const total = filtered.length;
-      const firstBatch = filtered.slice(0, this._pageSize);
-      const cards = await Promise.all(firstBatch.map(r => this._buildCard(r, selectedGuids, true, { compareBtn: true })));
-      const validCards = cards.filter(Boolean);
-      const toolbar = _resultsToolbarHtml(this._pageStart, firstBatch.length, total, this._pageSize, true, sortMode);
-      results.innerHTML = toolbar + '<div class="rv-cards-list">' + validCards.join('') + '</div>';
+      if (!opts.ignoreMode) await this._renderSearchPageFromMatchRecords(el);
       return;
     }
 
@@ -1142,18 +1518,6 @@ class Plugin extends AppPlugin {
         const seen = new Set();
         addSearchResults(searchResults, seen);
 
-        if (_debugSearchEnabled()) {
-          _logSearchDebug('after searchByQuery merge', {
-            pluginVersion: PLUGIN_VERSION,
-            query,
-            wantTypeMerge,
-            includeTypeSearch,
-            recsArrayLen: (searchResults.records || []).length,
-            linesArrayLen: (searchResults.lines || []).length,
-            mergedRecordCount: records.length,
-          });
-        }
-
         // Type-field merges only match words/#tags; they must also satisfy task + tagged date
         // (same tokens run alone through Thymer), or they would bypass @today / @due / status.
         let filterSetForTypeMerge = null;
@@ -1163,7 +1527,6 @@ class Plugin extends AppPlugin {
         }
 
         if (wantTypeMerge) {
-          const beforeType = records.length;
           const typeHits = await this._recordsMatchingTypeField(textsForType, tagsForType, selectedGuidsForTypeMerge);
           for (const r of typeHits) {
             if (seen.has(r.guid)) continue;
@@ -1171,17 +1534,12 @@ class Plugin extends AppPlugin {
             seen.add(r.guid);
             records.push(r);
           }
-          if (_debugSearchEnabled()) {
-            _logSearchDebug('include #types merge', {
-              beforeTypeMerge: beforeType,
-              afterTypeMerge: records.length,
-              added: records.length - beforeType,
-            });
-          }
         }
       } catch (err) {
         this._matchRecords = [];
-        results.innerHTML = `<div class="rv-empty"><span class="ti ti-alert-triangle"></span><div>${_esc(err.message)}</div></div>`;
+        if (!opts.ignoreMode) {
+          results.innerHTML = `<div class="rv-empty"><span class="ti ti-alert-triangle"></span><div>${_esc(err.message)}</div></div>`;
+        }
         return;
       }
 
@@ -1194,13 +1552,6 @@ class Plugin extends AppPlugin {
       } else {
         records = records.filter(r => this._recordColMap[r.guid]);
       }
-
-      if (_debugSearchEnabled()) {
-        _logSearchDebug('after sidebar / map filter', {
-          filterBySidebarCheckboxes: this._filterRecordsByCollectionCheckboxes,
-          count: records.length,
-        });
-      }
     }
 
     // Drop journal records with no real "Last modified" (same as UI "—"); those are empty journal shells.
@@ -1210,24 +1561,17 @@ class Plugin extends AppPlugin {
 
     if (filtered.length === 0) {
       this._matchRecords = [];
-      results.innerHTML = `<div class="rv-empty"><span class="ti ti-search-off"></span><div>No records found</div><div class="rv-empty-sub">Try adjusting your filters</div></div>`;
+      if (!opts.ignoreMode) {
+        results.innerHTML = `<div class="rv-empty"><span class="ti ti-search-off"></span><div>No records found</div><div class="rv-empty-sub">Try adjusting your filters</div></div>`;
+      }
       return;
-    }
-
-    if (_debugSearchEnabled()) {
-      _logSearchDebug('final (after blank-journal shell filter)', { count: filtered.length });
     }
 
     const sorted = _sortRecordsForDisplay(filtered, sortMode, this._recordColMap);
     this._matchRecords = sorted;
     this._isJournalResults = false;
     this._pageStart = 0;
-    const total = sorted.length;
-    const firstBatch = sorted.slice(0, this._pageSize);
-    const cards = await Promise.all(firstBatch.map(r => this._buildCard(r, selectedGuids, false, { compareBtn: true })));
-    const validCards = cards.filter(Boolean);
-    const toolbar = _resultsToolbarHtml(this._pageStart, firstBatch.length, total, this._pageSize, false, sortMode);
-    results.innerHTML = toolbar + '<div class="rv-cards-list">' + validCards.join('') + '</div>';
+    if (!opts.ignoreMode) await this._renderSearchPageFromMatchRecords(el);
   }
 
   /**
@@ -1327,8 +1671,7 @@ class Plugin extends AppPlugin {
     el.querySelector('.rv-results').addEventListener('click', async e => {
       if (e.target.closest('.rv-compare-back')) {
         e.preventDefault();
-        this._compareDiffOpen = false;
-        if (this._panelMode === 'compare') await this._renderCompareMain(el);
+        await this._goBackFromCompareDiff(el);
         return;
       }
       if (e.target.closest('.rv-compare-action-open')) {
@@ -1388,6 +1731,29 @@ class Plugin extends AppPlugin {
           const btn = c.querySelector('.rv-card-preview-toggle');
           if (btn) btn.setAttribute('aria-expanded', 'false');
         });
+        return;
+      }
+      if (e.target.closest('.rv-copy-result-list')) {
+        e.stopPropagation();
+        await this._copyResultListToClipboard(el);
+        return;
+      }
+      if (e.target.closest('.rv-dup-dismiss')) {
+        e.stopPropagation();
+        const btn = e.target.closest('.rv-dup-dismiss');
+        const enc = btn?.dataset.dupKey;
+        if (enc == null || enc === '') return;
+        try {
+          const key = decodeURIComponent(enc);
+          this._dupDismissedKeys.add(key);
+          if (this._dupGroups?.length) this._renderDuplicateResults(el, this._dupGroups);
+        } catch { /* ignore */ }
+        return;
+      }
+      if (e.target.closest('.rv-dup-reset-dismissed')) {
+        e.stopPropagation();
+        this._dupDismissedKeys.clear();
+        if (this._dupGroups?.length) this._renderDuplicateResults(el, this._dupGroups);
         return;
       }
       if (e.target.closest('.rv-card-preview-toggle')) {
@@ -1480,24 +1846,50 @@ function _tokensForTypeMerge(raw) {
 
 /** True if the user is using Thymer’s @collection=… scope in the search box (don’t filter by local checkboxes). */
 function _searchStringUsesThymerCollectionScope(raw) {
-  return typeof raw === 'string' && /@collection\s*=/.test(raw);
+  return typeof raw === 'string' && /@collection\s*=/i.test(raw);
 }
 
-/** Opt-in: `localStorage.setItem('rv_debug_search', '1')` then reload; logs search pipeline counts to the console. */
-function _debugSearchEnabled() {
-  try {
-    return localStorage.getItem('rv_debug_search') === '1';
-  } catch {
-    return false;
+/**
+ * Extracts each @collection=… value from search text (quoted or unquoted).
+ * Matches Thymer-style `@collection="Name"` and `@collection=Name`. Case-insensitive on the token.
+ */
+function _parseThymerCollectionNamesFromSearch(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return [];
+  const out = [];
+  const lower = raw.toLowerCase();
+  const needle = '@collection';
+  let i = 0;
+  while (i < raw.length) {
+    const idx = lower.indexOf(needle, i);
+    if (idx === -1) break;
+    let j = idx + needle.length;
+    while (j < raw.length && /\s/.test(raw[j])) j++;
+    if (raw[j] !== '=') {
+      i = idx + 1;
+      continue;
+    }
+    j++;
+    while (j < raw.length && /\s/.test(raw[j])) j++;
+    if (j >= raw.length) break;
+    const c = raw[j];
+    if (c === '"' || c === "'") {
+      const end = raw.indexOf(c, j + 1);
+      if (end > j) {
+        out.push(raw.slice(j + 1, end));
+        i = end + 1;
+        continue;
+      }
+    }
+    const tail = raw.slice(j);
+    const um = /^[^\s@]+/.exec(tail);
+    if (um) {
+      out.push(um[0]);
+      i = j + um[0].length;
+    } else {
+      i = j + 1;
+    }
   }
-}
-
-function _logSearchDebug(stage, payload) {
-  try {
-    console.log(`[${PLUGIN_NAME}]`, stage, payload);
-  } catch {
-    /* ignore */
-  }
+  return out.map(t => t.trim()).filter(Boolean);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -1661,6 +2053,8 @@ function _resultsToolbarHtml(pageStart, batchLen, total, pageSize, isJournal, so
       <button type="button" class="rv-link rv-expand-all">expand all</button>
       <span>·</span>
       <button type="button" class="rv-link rv-collapse-all">collapse all</button>
+      <span>·</span>
+      <button type="button" class="rv-link rv-copy-result-list" title="Copy list of titles, collections, and record IDs (tab-separated)">Copy list</button>
     </span>
   </div>
   ${sortRow}
@@ -1825,6 +2219,60 @@ function _isBuiltinTimestampProperty(prop) {
   const modified = /^(modified|updated|updated\s+at|last\s+modified|date\s+modified)$/.test(label)
     || /^(modified|updated|updatedat|lastmodified|date_modified)$/.test(id);
   return created || modified;
+}
+
+/** Stable string for one property; dates as ISO for cross-locale duplicate matching. */
+function _dupPropertyValueString(record, prop) {
+  const name = prop.field?.label || prop.name || '';
+  if (!name) return null;
+  try {
+    const d = record.date(name);
+    if (d) {
+      try {
+        const dt = d instanceof Date ? d : new Date(d);
+        if (!Number.isNaN(dt.getTime())) return dt.toISOString();
+      } catch { /* fall through */ }
+      return String(d);
+    }
+    const num = record.number(name);
+    if (num != null && !Number.isNaN(num)) return String(num);
+    const txt = record.text(name);
+    if (txt) {
+      const t = String(txt).trim();
+      if (!t) return null;
+      return t.length > DUP_PROP_MAX_PER_FIELD ? t.slice(0, DUP_PROP_MAX_PER_FIELD) + '…' : t;
+    }
+  } catch { return null; }
+  return null;
+}
+
+/** Canonical property lines for duplicate body comparison (sorted, capped). */
+function _extractPropertiesTextForDup(record) {
+  let props;
+  try {
+    props = record.getAllProperties().filter(p => !_isBuiltinTimestampProperty(p));
+  } catch {
+    return '';
+  }
+  const withVal = [];
+  for (const p of props) {
+    const key = `${String(p.field?.id || '')}\0${String(p.name || '')}`;
+    const val = _dupPropertyValueString(record, p);
+    if (val == null || val === '') continue;
+    const label = String(p.field?.label || p.name || '').trim() || key;
+    withVal.push({ key, label, val });
+  }
+  withVal.sort((a, b) => a.key.localeCompare(b.key, undefined, { sensitivity: 'base' }));
+  const lines = [];
+  let total = 0;
+  for (const { label, val } of withVal) {
+    const line = `${label}: ${val}`;
+    const add = line.length + (lines.length ? 1 : 0);
+    if (total + add > DUP_PROP_MAX_TOTAL) break;
+    lines.push(line);
+    total += add;
+  }
+  return lines.join('\n');
 }
 
 /** Longer values for expanded card details. */
@@ -2022,7 +2470,7 @@ function _normalizeBodyForHash(s) {
   return String(s || '').trim().replace(/\s+/g, ' ');
 }
 
-async function _extractRecordFullText(record) {
+async function _extractRecordFullText(record, opts = {}) {
   const chunks = [];
   try {
     const lines = await record.getLineItems(false);
@@ -2038,13 +2486,20 @@ async function _extractRecordFullText(record) {
       if (t) chunks.push(t);
     }
   } catch { /* skip */ }
-  return chunks.join('\n');
+  let out = chunks.join('\n');
+  if (opts.includeProps) {
+    const propsBlob = _extractPropertiesTextForDup(record);
+    if (propsBlob) {
+      out = out ? `${out}\n\n---\n${propsBlob}` : `---\n${propsBlob}`;
+    }
+  }
+  return out;
 }
 
-async function _recordsWithBodyText(records) {
+async function _recordsWithBodyText(records, includeProps = false) {
   const out = [];
   for (const r of records) {
-    const body = await _extractRecordFullText(r);
+    const body = await _extractRecordFullText(r, { includeProps });
     out.push({ record: r, body });
   }
   return out;
@@ -2059,7 +2514,8 @@ function _hashStr(s) {
   return String(h >>> 0);
 }
 
-function _duplicateGroupsContentExact(withText) {
+function _duplicateGroupsContentExact(withText, opts = {}) {
+  const label = opts.includeProps ? 'Same body text (+ properties)' : 'Same body text';
   const map = new Map();
   for (const { record, body } of withText) {
     const k = _hashStr(_normalizeBodyForHash(body));
@@ -2069,7 +2525,7 @@ function _duplicateGroupsContentExact(withText) {
   const groups = [];
   for (const recs of map.values()) {
     if (recs.length < 2) continue;
-    groups.push({ label: 'Same body text', records: recs });
+    groups.push({ label, records: recs });
   }
   groups.sort((a, b) => b.records.length - a.records.length);
   return groups;
@@ -2085,7 +2541,7 @@ function _jaccardWords(a, b) {
   return uni ? inter / uni : 0;
 }
 
-function _duplicateGroupsContentSimilar(withText, threshold) {
+function _duplicateGroupsContentSimilar(withText, threshold, opts = {}) {
   const n = withText.length;
   if (n < 2) return [];
   const uf = new _UnionFind(n);
@@ -2102,10 +2558,14 @@ function _duplicateGroupsContentSimilar(withText, threshold) {
     buck.get(r).push(withText[i].record);
   }
   const groups = [];
+  const pct = Math.round(threshold * 100);
+  const label = opts.includeProps
+    ? `Similar body (+ properties) (${pct}%+ word overlap)`
+    : `Similar body (${pct}%+ word overlap)`;
   for (const g of buck.values()) {
     if (g.length < 2) continue;
     groups.push({
-      label: `Similar body (${Math.round(threshold * 100)}%+ word overlap)`,
+      label,
       records: g,
     });
   }
@@ -2145,6 +2605,473 @@ function _diffLines(textA, textB) {
   return seq;
 }
 
+/** Max line count per dimension for full 3-way alignment DP (memory ~ (n+1)(m+1)(p+1) cells). */
+const _THREE_WAY_DP_MAX_LINES = 200;
+const _THREE_WAY_DP_MAX_CELLS = 5_500_000;
+
+/**
+ * Per-row highlight flags for three aligned lines (two agree → odd column out; all differ → all).
+ */
+function _tripleConsensusFlags(L0, L1, L2) {
+  if (L0 === L1 && L1 === L2) {
+    return { allEq: true, d0: false, d1: false, d2: false };
+  }
+  if (L1 === L2) {
+    const odd = L0 !== L1;
+    return { allEq: false, d0: odd, d1: false, d2: false };
+  }
+  if (L0 === L2) {
+    const odd = L1 !== L0;
+    return { allEq: false, d0: false, d1: odd, d2: false };
+  }
+  if (L0 === L1) {
+    const odd = L2 !== L0;
+    return { allEq: false, d0: false, d1: false, d2: odd };
+  }
+  return { allEq: false, d0: true, d1: true, d2: true };
+}
+
+/** Fallback: naive same-index rows (only when line count exceeds DP budget). */
+function _diffLinesTripleIndexedFallback(a, b, c) {
+  const max = Math.max(a.length, b.length, c.length);
+  const rows = [];
+  for (let i = 0; i < max; i++) {
+    const L0 = a[i] ?? '';
+    const L1 = b[i] ?? '';
+    const L2 = c[i] ?? '';
+    const { allEq, d0, d1, d2 } = _tripleConsensusFlags(L0, L1, L2);
+    rows.push({ allEq, L0, L1, L2, d0, d1, d2 });
+  }
+  return rows;
+}
+
+/**
+ * 3-way line alignment (dynamic programming over line arrays): matches insert/delete/move
+ * across columns like a merge, not raw line index. Rows are (L0,L1,L2) with '' for gaps;
+ * highlights use _tripleConsensusFlags. Falls back to index alignment if DP budget exceeded.
+ */
+function _diffLinesTripleAligned(a, b, c) {
+  const n = a.length;
+  const m = b.length;
+  const p = c.length;
+  const cells = (n + 1) * (m + 1) * (p + 1);
+  if (
+    n > _THREE_WAY_DP_MAX_LINES ||
+    m > _THREE_WAY_DP_MAX_LINES ||
+    p > _THREE_WAY_DP_MAX_LINES ||
+    cells > _THREE_WAY_DP_MAX_CELLS
+  ) {
+    return _diffLinesTripleIndexedFallback(a, b, c);
+  }
+
+  const NINF = -1e9;
+  const dp = new Float64Array(cells);
+  dp.fill(NINF);
+  dp[0] = 0;
+
+  const idx = (i, j, k) => i * (m + 1) * (p + 1) + j * (p + 1) + k;
+
+  for (let i = 0; i <= n; i++) {
+    for (let j = 0; j <= m; j++) {
+      for (let k = 0; k <= p; k++) {
+        if (i === 0 && j === 0 && k === 0) continue;
+        let best = NINF;
+        const relax = (v, pred) => {
+          if (pred > NINF / 2) best = Math.max(best, pred + v);
+        };
+
+        if (i > 0 && j > 0 && k > 0) {
+          const ta = a[i - 1];
+          const tb = b[j - 1];
+          const tc = c[k - 1];
+          relax(ta === tb && tb === tc ? 3 : 0, dp[idx(i - 1, j - 1, k - 1)]);
+        }
+        if (i > 0 && j > 0 && a[i - 1] === b[j - 1]) relax(2, dp[idx(i - 1, j - 1, k)]);
+        if (i > 0 && k > 0 && a[i - 1] === c[k - 1]) relax(2, dp[idx(i - 1, j, k - 1)]);
+        if (j > 0 && k > 0 && b[j - 1] === c[k - 1]) relax(2, dp[idx(i, j - 1, k - 1)]);
+        if (i > 0) relax(0, dp[idx(i - 1, j, k)]);
+        if (j > 0) relax(0, dp[idx(i, j - 1, k)]);
+        if (k > 0) relax(0, dp[idx(i, j, k - 1)]);
+
+        dp[idx(i, j, k)] = best;
+      }
+    }
+  }
+
+  if (dp[idx(n, m, p)] <= NINF / 2) {
+    return _diffLinesTripleIndexedFallback(a, b, c);
+  }
+
+  const rows = [];
+  let i = n;
+  let j = m;
+  let k = p;
+  while (i > 0 || j > 0 || k > 0) {
+    const cur = dp[idx(i, j, k)];
+
+    const tryTripleEq = () => {
+      if (i > 0 && j > 0 && k > 0) {
+        const ta = a[i - 1];
+        const tb = b[j - 1];
+        const tc = c[k - 1];
+        if (ta === tb && tb === tc && dp[idx(i - 1, j - 1, k - 1)] + 3 === cur) {
+          rows.push({ L0: ta, L1: tb, L2: tc });
+          i--;
+          j--;
+          k--;
+          return true;
+        }
+      }
+      return false;
+    };
+    const tryPairAB = () => {
+      if (i > 0 && j > 0 && a[i - 1] === b[j - 1] && dp[idx(i - 1, j - 1, k)] + 2 === cur) {
+        rows.push({ L0: a[i - 1], L1: b[j - 1], L2: '' });
+        i--;
+        j--;
+        return true;
+      }
+      return false;
+    };
+    const tryPairAC = () => {
+      if (i > 0 && k > 0 && a[i - 1] === c[k - 1] && dp[idx(i - 1, j, k - 1)] + 2 === cur) {
+        rows.push({ L0: a[i - 1], L1: '', L2: c[k - 1] });
+        i--;
+        k--;
+        return true;
+      }
+      return false;
+    };
+    const tryPairBC = () => {
+      if (j > 0 && k > 0 && b[j - 1] === c[k - 1] && dp[idx(i, j - 1, k - 1)] + 2 === cur) {
+        rows.push({ L0: '', L1: b[j - 1], L2: c[k - 1] });
+        j--;
+        k--;
+        return true;
+      }
+      return false;
+    };
+    const tryTripleMis = () => {
+      if (i > 0 && j > 0 && k > 0) {
+        const ta = a[i - 1];
+        const tb = b[j - 1];
+        const tc = c[k - 1];
+        if (!(ta === tb && tb === tc) && dp[idx(i - 1, j - 1, k - 1)] === cur) {
+          rows.push({ L0: ta, L1: tb, L2: tc });
+          i--;
+          j--;
+          k--;
+          return true;
+        }
+      }
+      return false;
+    };
+    const tryA = () => {
+      if (i > 0 && dp[idx(i - 1, j, k)] === cur) {
+        rows.push({ L0: a[i - 1], L1: '', L2: '' });
+        i--;
+        return true;
+      }
+      return false;
+    };
+    const tryB = () => {
+      if (j > 0 && dp[idx(i, j - 1, k)] === cur) {
+        rows.push({ L0: '', L1: b[j - 1], L2: '' });
+        j--;
+        return true;
+      }
+      return false;
+    };
+    const tryC = () => {
+      if (k > 0 && dp[idx(i, j, k - 1)] === cur) {
+        rows.push({ L0: '', L1: '', L2: c[k - 1] });
+        k--;
+        return true;
+      }
+      return false;
+    };
+
+    const step =
+      tryTripleEq() ||
+      tryPairAB() ||
+      tryPairAC() ||
+      tryPairBC() ||
+      tryTripleMis() ||
+      tryA() ||
+      tryB() ||
+      tryC();
+
+    if (!step) {
+      if (i > 0) {
+        rows.push({ L0: a[i - 1], L1: '', L2: '' });
+        i--;
+      } else if (j > 0) {
+        rows.push({ L0: '', L1: b[j - 1], L2: '' });
+        j--;
+      } else if (k > 0) {
+        rows.push({ L0: '', L1: '', L2: c[k - 1] });
+        k--;
+      } else break;
+    }
+  }
+
+  rows.reverse();
+  return rows.map(({ L0, L1, L2 }) => {
+    const { allEq, d0, d1, d2 } = _tripleConsensusFlags(L0, L1, L2);
+    return { allEq, L0, L1, L2, d0, d1, d2 };
+  });
+}
+
+function _diffLinesTriple(text0, text1, text2) {
+  const a = String(text0 || '').split('\n');
+  const b = String(text1 || '').split('\n');
+  const c = String(text2 || '').split('\n');
+  return _diffLinesTripleAligned(a, b, c);
+}
+
+function _tripleColLineClass(allEq, colIdx, differs) {
+  if (allEq || !differs) return 'rv-diff-col-line rv-diff-equal';
+  return `rv-diff-col-line rv-diff-triple-changed rv-diff-triple-changed--${colIdx}`;
+}
+
+/** Display value for one property in compare (locale dates; same filters as card expanded props). */
+function _comparePropertyDisplayValue(record, prop) {
+  const name = prop.field?.label || prop.name || '';
+  if (!name) return null;
+  try {
+    const date = record.date(name);
+    if (date) return date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+    const num = record.number(name);
+    if (num != null && !Number.isNaN(num)) return String(num);
+    const txt = record.text(name);
+    if (txt) {
+      const t = String(txt).trim();
+      if (!t) return null;
+      return t.length > 800 ? t.slice(0, 800) + '…' : t;
+    }
+  } catch { return null; }
+  return null;
+}
+
+/** Sorted "Label: value" lines for compare property panel. */
+function _comparePropertyLinesForDisplay(record) {
+  let props;
+  try {
+    props = record.getAllProperties().filter(p => !_isBuiltinTimestampProperty(p));
+  } catch {
+    return [];
+  }
+  const rows = [];
+  for (const p of props) {
+    const key = `${String(p.field?.id || '')}\0${String(p.name || '')}`;
+    const val = _comparePropertyDisplayValue(record, p);
+    if (val == null || val === '') continue;
+    const label = String(p.field?.label || p.name || '').trim() || key;
+    rows.push({ key, line: `${label}: ${val}` });
+  }
+  rows.sort((a, b) => a.key.localeCompare(b.key, undefined, { sensitivity: 'base' }));
+  return rows.map(r => r.line);
+}
+
+/** Map stable key → { label, display, fieldName } for keyed compare (non-empty values only). */
+function _comparePropertyMapForDisplay(record) {
+  const map = new Map();
+  let props;
+  try {
+    props = record.getAllProperties().filter(p => !_isBuiltinTimestampProperty(p));
+  } catch {
+    return map;
+  }
+  for (const p of props) {
+    const key = `${String(p.field?.id || '')}\0${String(p.name || '')}`;
+    const val = _comparePropertyDisplayValue(record, p);
+    if (val == null || val === '') continue;
+    const label = String(p.field?.label || p.name || '').trim() || key;
+    const fieldName = p.field?.label || p.name || '';
+    map.set(key, { label, display: val, fieldName });
+  }
+  return map;
+}
+
+/** True if two property entries represent the same value (dates by instant, numbers by value, else normalized display). */
+function _comparePropertyEntriesEqual(recordA, recordB, entryA, entryB) {
+  if (!entryA || !entryB) return false;
+  const nameA = entryA.fieldName;
+  const nameB = entryB.fieldName;
+  try {
+    const dA = recordA.date(nameA);
+    const dB = recordB.date(nameB);
+    if (dA && dB) {
+      const ta = dA instanceof Date ? dA.getTime() : new Date(dA).getTime();
+      const tb = dB instanceof Date ? dB.getTime() : new Date(dB).getTime();
+      if (!Number.isNaN(ta) && !Number.isNaN(tb)) return ta === tb;
+    }
+    const nA = recordA.number(nameA);
+    const nB = recordB.number(nameB);
+    if (nA != null && nB != null && !Number.isNaN(nA) && !Number.isNaN(nB)) return nA === nB;
+  } catch { /* fall through */ }
+  return _normalizeBodyForHash(entryA.display) === _normalizeBodyForHash(entryB.display);
+}
+
+/** All three property entries present and pairwise semantically equal. */
+function _comparePropertyEntriesEqualThree(recordA, recordB, recordC, ea, eb, ec) {
+  if (!ea || !eb || !ec) return false;
+  return (
+    _comparePropertyEntriesEqual(recordA, recordB, ea, eb) &&
+    _comparePropertyEntriesEqual(recordB, recordC, eb, ec) &&
+    _comparePropertyEntriesEqual(recordA, recordC, ea, ec)
+  );
+}
+
+/**
+ * Per-column state for 3-way keyed properties: `missing` = no value here (softer tint),
+ * `exclusive` / `mismatch` = strong column tint (only note with key, or unequal values).
+ */
+function _triplePropCellKind(recordA, recordB, recordC, ea, eb, ec, col) {
+  const present = [!!ea, !!eb, !!ec];
+  const count = present[0] + present[1] + present[2];
+  const entries = [ea, eb, ec];
+  const records = [recordA, recordB, recordC];
+  const e = entries[col];
+  if (!e) return 'missing';
+  if (count === 1) return 'exclusive';
+  let differs = false;
+  for (let j = 0; j < 3; j++) {
+    if (j === col || !entries[j]) continue;
+    if (!_comparePropertyEntriesEqual(records[col], records[j], e, entries[j])) differs = true;
+  }
+  return differs ? 'mismatch' : 'equal';
+}
+
+/** `<pre>` class for 3-way keyed property cells. */
+function _tripleKeyedPropCellClass(allEq, colIdx, kind) {
+  if (allEq || kind === 'equal') return 'rv-diff-cell rv-diff-equal';
+  if (kind === 'missing') return `rv-diff-cell rv-diff-cell--missing rv-diff-cell--missing-${colIdx}`;
+  return `rv-diff-cell rv-diff-triple-changed rv-diff-triple-changed--${colIdx}`;
+}
+
+/** Collapsible properties block; `open` = expanded by default (used where keyed diff is not shown). */
+function _renderComparePropertiesCollapsible(record) {
+  const lines = _comparePropertyLinesForDisplay(record);
+  const n = lines.length;
+  const inner = lines.length
+    ? lines.map(l => `<div class="rv-compare-prop-line">${_esc(l)}</div>`).join('')
+    : '<div class="rv-compare-prop-empty">No custom properties</div>';
+  return `<details class="rv-compare-props" open>
+  <summary class="rv-compare-props-summary"><span class="ti ti-chevron-right rv-compare-props-chevron" aria-hidden="true"></span> Properties (${n})</summary>
+  <div class="rv-compare-props-body">${inner}</div>
+</details>`;
+}
+
+/**
+ * Two-pane: aligned columns per property key; diff colors for equal / mismatch / left-only / right-only.
+ */
+function _renderComparePropertiesTwoPaneKeyed(recordA, recordB, titleA = '', titleB = '') {
+  const mapA = _comparePropertyMapForDisplay(recordA);
+  const mapB = _comparePropertyMapForDisplay(recordB);
+  const allKeys = new Set([...mapA.keys(), ...mapB.keys()]);
+  const keys = [...allKeys].sort((ka, kb) => {
+    const la = (mapA.get(ka) || mapB.get(ka)).label;
+    const lb = (mapA.get(kb) || mapB.get(kb)).label;
+    return la.localeCompare(lb, undefined, { sensitivity: 'base' });
+  });
+
+  let inner;
+  if (keys.length === 0) {
+    inner = '<div class="rv-compare-prop-empty">No custom properties</div>';
+  } else {
+    const head = `<div class="rv-compare-props-keyed-head">
+  <div class="rv-compare-props-keyed-hcell">${_esc(_truncateDisplay(String(titleA || 'Left'), 36))}</div>
+  <div class="rv-compare-props-keyed-hcell">${_esc(_truncateDisplay(String(titleB || 'Right'), 36))}</div>
+</div>`;
+    const rows = keys
+      .map(key => {
+        const entryA = mapA.get(key);
+        const entryB = mapB.get(key);
+        let rowClass = 'rv-diff-equal';
+        if (entryA && entryB) {
+          rowClass = _comparePropertyEntriesEqual(recordA, recordB, entryA, entryB)
+            ? 'rv-diff-equal'
+            : 'rv-prop-diff-mismatch';
+        } else if (entryA && !entryB) {
+          rowClass = 'rv-diff-del';
+        } else if (!entryA && entryB) {
+          rowClass = 'rv-diff-add';
+        } else {
+          return '';
+        }
+        const leftLine = entryA ? `${entryA.label}: ${entryA.display}` : '';
+        const rightLine = entryB ? `${entryB.label}: ${entryB.display}` : '';
+        const leftInner = entryA ? _esc(leftLine) : '<span class="rv-prop-missing">—</span>';
+        const rightInner = entryB ? _esc(rightLine) : '<span class="rv-prop-missing">—</span>';
+        const leftPreCls = entryA ? 'rv-diff-cell' : 'rv-diff-cell rv-diff-cell--missing rv-diff-cell--missing-0';
+        const rightPreCls = entryB ? 'rv-diff-cell' : 'rv-diff-cell rv-diff-cell--missing rv-diff-cell--missing-1';
+        return `<div class="rv-diff-row ${rowClass}"><pre class="${leftPreCls}">${leftInner}</pre><pre class="${rightPreCls}">${rightInner}</pre></div>`;
+      })
+      .filter(Boolean)
+      .join('');
+    inner = `<div class="rv-compare-props-keyed-wrap">${head}<div class="rv-diff-grid rv-diff-grid--props">${rows}</div></div>`;
+  }
+  return `<details class="rv-compare-props" open>
+  <summary class="rv-compare-props-summary"><span class="ti ti-chevron-right rv-compare-props-chevron" aria-hidden="true"></span> Properties (${keys.length})</summary>
+  <div class="rv-compare-props-body rv-compare-props-body--diff">${inner}</div>
+</details>`;
+}
+
+/**
+ * Three-pane: one keyed grid (same keys across columns) with per-cell semantic diff tints.
+ */
+function _renderComparePropertiesThreePaneKeyed(recordA, recordB, recordC, titleA = '', titleB = '', titleC = '') {
+  const mapA = _comparePropertyMapForDisplay(recordA);
+  const mapB = _comparePropertyMapForDisplay(recordB);
+  const mapC = _comparePropertyMapForDisplay(recordC);
+  const allKeys = new Set([...mapA.keys(), ...mapB.keys(), ...mapC.keys()]);
+  const keys = [...allKeys].sort((ka, kb) => {
+    const la = (mapA.get(ka) || mapB.get(ka) || mapC.get(ka)).label;
+    const lb = (mapA.get(kb) || mapB.get(kb) || mapC.get(kb)).label;
+    return la.localeCompare(lb, undefined, { sensitivity: 'base' });
+  });
+
+  let inner;
+  if (keys.length === 0) {
+    inner = '<div class="rv-compare-prop-empty">No custom properties</div>';
+  } else {
+    const head = `<div class="rv-compare-props-keyed-head rv-compare-props-keyed-head--triple">
+  <div class="rv-compare-props-keyed-hcell">${_esc(_truncateDisplay(String(titleA || 'Left'), 28))}</div>
+  <div class="rv-compare-props-keyed-hcell">${_esc(_truncateDisplay(String(titleB || 'Middle'), 28))}</div>
+  <div class="rv-compare-props-keyed-hcell">${_esc(_truncateDisplay(String(titleC || 'Right'), 28))}</div>
+</div>`;
+    const rows = keys
+      .map(key => {
+        const ea = mapA.get(key);
+        const eb = mapB.get(key);
+        const ec = mapC.get(key);
+        if (!ea && !eb && !ec) return '';
+        const allEq = _comparePropertyEntriesEqualThree(recordA, recordB, recordC, ea, eb, ec);
+        const k0 = _triplePropCellKind(recordA, recordB, recordC, ea, eb, ec, 0);
+        const k1 = _triplePropCellKind(recordA, recordB, recordC, ea, eb, ec, 1);
+        const k2 = _triplePropCellKind(recordA, recordB, recordC, ea, eb, ec, 2);
+        const line0 = ea ? `${ea.label}: ${ea.display}` : '';
+        const line1 = eb ? `${eb.label}: ${eb.display}` : '';
+        const line2 = ec ? `${ec.label}: ${ec.display}` : '';
+        const inner0 = ea ? _esc(line0) : '<span class="rv-prop-missing">—</span>';
+        const inner1 = eb ? _esc(line1) : '<span class="rv-prop-missing">—</span>';
+        const inner2 = ec ? _esc(line2) : '<span class="rv-prop-missing">—</span>';
+        const c0 = _tripleKeyedPropCellClass(allEq, 0, k0);
+        const c1 = _tripleKeyedPropCellClass(allEq, 1, k1);
+        const c2 = _tripleKeyedPropCellClass(allEq, 2, k2);
+        return `<div class="rv-diff-prop-row-triple"><pre class="${c0}">${inner0}</pre><pre class="${c1}">${inner1}</pre><pre class="${c2}">${inner2}</pre></div>`;
+      })
+      .filter(Boolean)
+      .join('');
+    inner = `<div class="rv-compare-props-keyed-wrap">${head}<div class="rv-diff-grid rv-diff-grid--props rv-diff-grid--props-triple">${rows}</div></div>`;
+  }
+  return `<details class="rv-compare-props" open>
+  <summary class="rv-compare-props-summary"><span class="ti ti-chevron-right rv-compare-props-chevron" aria-hidden="true"></span> Properties (${keys.length})</summary>
+  <div class="rv-compare-props-body rv-compare-props-body--diff">${inner}</div>
+</details>`;
+}
+
 function _compareRecordActionsHtml(guid, fileName) {
   const g = _esc(guid);
   const raw = String(fileName ?? '').trim() || '(untitled)';
@@ -2158,7 +3085,7 @@ function _compareRecordActionsHtml(guid, fileName) {
 </div>`;
 }
 
-function _renderTwoPaneDiffHtml(titleA, titleB, seq, guidA, guidB) {
+function _renderTwoPaneDiffHtml(titleA, titleB, seq, guidA, guidB, backLabel = 'Back to list', propsDiffHtml = '') {
   const rows = seq
     .map(({ t, left, right }) => {
       const cls = t === 'both' ? 'rv-diff-equal' : t === 'left' ? 'rv-diff-del' : 'rv-diff-add';
@@ -2167,32 +3094,51 @@ function _renderTwoPaneDiffHtml(titleA, titleB, seq, guidA, guidB) {
     .join('');
   return `<div class="rv-compare-diff-wrap">
   <div class="rv-compare-diff-header">
-    <button type="button" class="rv-link rv-compare-back">Back to list</button>
+    <button type="button" class="rv-link rv-compare-back">${_esc(backLabel)}</button>
     <span class="rv-compare-diff-titles"><span>${_esc(_truncateDisplay(titleA, 40))}</span><span class="rv-diff-vs">vs</span><span>${_esc(_truncateDisplay(titleB, 40))}</span></span>
   </div>
   <div class="rv-compare-col-actions-row">
     <div class="rv-compare-col-actions-cell">${_compareRecordActionsHtml(guidA, titleA)}</div>
     <div class="rv-compare-col-actions-cell">${_compareRecordActionsHtml(guidB, titleB)}</div>
   </div>
+  <div class="rv-compare-props-row rv-compare-props-row--full">
+    <div class="rv-compare-props-cell">${propsDiffHtml}</div>
+  </div>
   <div class="rv-diff-grid">${rows}</div>
 </div>`;
 }
 
-function _renderTriplePaneHtml(titles, texts, guids) {
-  const cols = titles
-    .map((t, i) => {
-      const gid = guids[i] || '';
-      return `<div class="rv-diff-col"><div class="rv-diff-col-head">
+function _renderTriplePaneHtml(titles, texts, guids, backLabel = 'Back to list', propsHtml = '') {
+  const bodyRows = _diffLinesTriple(texts[0], texts[1], texts[2]);
+  const heads = [0, 1, 2]
+    .map(colIdx => {
+      const t = titles[colIdx] || '';
+      const gid = guids[colIdx] || '';
+      return `<div class="rv-diff-triple-head-cell"><div class="rv-diff-col-head">
   ${gid ? _compareRecordActionsHtml(gid, t) : `<span class="rv-compare-file-name">${_esc(_truncateDisplay(t, 48))}</span>`}
-</div><pre class="rv-diff-col-body">${_esc(texts[i] || '')}</pre></div>`;
+</div></div>`;
     })
     .join('');
+  const bodyCells = bodyRows.flatMap(r =>
+    [0, 1, 2].map(colIdx => {
+      const Lk = colIdx === 0 ? 'L0' : colIdx === 1 ? 'L1' : 'L2';
+      const Dk = colIdx === 0 ? 'd0' : colIdx === 1 ? 'd1' : 'd2';
+      const line = r[Lk];
+      const cls = _tripleColLineClass(r.allEq, colIdx, r[Dk]);
+      return `<pre class="${cls}">${_esc(line)}</pre>`;
+    })
+  );
+  const bodySync = `<div class="rv-diff-triple-body-span"><div class="rv-diff-triple-body-sync">${bodyCells.join('')}</div></div>`;
   return `<div class="rv-compare-diff-wrap rv-compare-diff-wrap--triple">
   <div class="rv-compare-diff-header">
-    <button type="button" class="rv-link rv-compare-back">Back to list</button>
+    <button type="button" class="rv-link rv-compare-back">${_esc(backLabel)}</button>
     <span class="rv-compare-diff-hint">Three notes side by side</span>
   </div>
-  <div class="rv-diff-triple">${cols}</div>
+  <div class="rv-diff-triple rv-diff-triple--keyed-props">
+    ${heads}
+    <div class="rv-diff-triple-props-span">${propsHtml}</div>
+    ${bodySync}
+  </div>
 </div>`;
 }
 
@@ -2219,6 +3165,12 @@ function _filterDupGroupsForDisplay(groups, filterText, recordColMap) {
   return { filtered, totalBeforeFilter };
 }
 
+/** Stable id for a duplicate group (label + sorted record GUIDs). */
+function _dupGroupKey(g) {
+  const guids = (g.records || []).map(r => r?.guid).filter(Boolean).sort();
+  return `${String(g.label || '')}\0${guids.join(',')}`;
+}
+
 /**
  * Client-side filter for compare-mode result list (case-insensitive substring).
  * Matches note title or collection name from `recordColMap`.
@@ -2239,6 +3191,23 @@ function _filterRecordsForCompareDisplay(records, filterText, recordColMap) {
   return { filtered, totalBeforeFilter };
 }
 
+/** TSV lines: Title, Collection, Record ID — for clipboard / spreadsheets. */
+function _formatRecordListForClipboard(records, recordColMap) {
+  const lines = ['Title\tCollection\tRecord ID'];
+  const flat = s => String(s ?? '').replace(/\r|\n|\t/g, ' ');
+  for (const r of records) {
+    if (!r) continue;
+    let title = '(untitled)';
+    try {
+      title = String(r.getName() || '').trim() || '(untitled)';
+    } catch { /* ignore */ }
+    const m = recordColMap?.[r.guid];
+    const col = m ? flat(m.colName) : '';
+    lines.push([flat(title), col, String(r.guid)].join('\t'));
+  }
+  return lines.join('\n');
+}
+
 // ─── Static HTML ─────────────────────────────────────────────────────────────
 
 const SHELL_HTML = `
@@ -2252,13 +3221,65 @@ const SHELL_HTML = `
     <div class="rv-mode-bar">
       <button type="button" class="rv-mode-btn rv-mode-btn--active" data-mode="search">Search</button>
       <button type="button" class="rv-mode-btn" data-mode="duplicates">Duplicates</button>
-      <button type="button" class="rv-mode-btn" data-mode="compare">Compare</button>
     </div>
 
     <div class="rv-block rv-block-search">
 
-    <div class="rv-section">
+    <div class="rv-active-filters-summary" aria-live="polite"></div>
+
+    <div class="rv-section rv-section--filter-tagged">
       <div class="rv-section-label">
+        <span class="rv-section-active-icon ti" aria-hidden="true"></span>
+        Tagged Date
+        <span class="rv-col-actions">
+          <button type="button" class="rv-link rv-tagged-date-clear">clear</button>
+        </span>
+      </div>
+      <div class="rv-date-bar"></div>
+    </div>
+
+    <div class="rv-section rv-section--filter-journal">
+      <div class="rv-section-label">
+        <span class="rv-section-active-icon ti" aria-hidden="true"></span>
+        Journal Date
+        <span class="rv-col-actions">
+          <button type="button" class="rv-link rv-journal-clear">clear</button>
+        </span>
+      </div>
+      <div class="rv-journal-date-bar">
+        <div class="rv-journal-nav">
+          <button class="rv-journal-prev" title="Previous day">‹</button>
+          <span class="rv-journal-label">—</span>
+          <button class="rv-journal-next" title="Next day">›</button>
+        </div>
+        <div class="rv-journal-chips">
+          <button class="rv-chip rv-jchip" data-jdate="lastwk">last wk</button>
+          <button class="rv-chip rv-jchip" data-jdate="today">Today</button>
+          <button class="rv-chip rv-jchip" data-jdate="nextwk">next wk</button>
+        </div>
+        <div class="rv-journal-range-row">
+          <span class="rv-journal-range-label">Range</span>
+          <label class="rv-journal-range-opt"><input type="radio" name="rv-journal-range" class="rv-journal-range" value="single" checked> 1 day</label>
+          <label class="rv-journal-range-opt"><input type="radio" name="rv-journal-range" class="rv-journal-range" value="span3"> 3 days</label>
+          <label class="rv-journal-range-opt"><input type="radio" name="rv-journal-range" class="rv-journal-range" value="span7"> 7 days</label>
+        </div>
+      </div>
+    </div>
+
+    <div class="rv-section rv-section--filter-status">
+      <div class="rv-section-label">
+        <span class="rv-section-active-icon ti" aria-hidden="true"></span>
+        Task status
+        <span class="rv-col-actions">
+          <button type="button" class="rv-link rv-task-status-clear">clear</button>
+        </span>
+      </div>
+      <div class="rv-status-bar"></div>
+    </div>
+
+    <div class="rv-section rv-section--filter-search">
+      <div class="rv-section-label">
+        <span class="rv-section-active-icon ti" aria-hidden="true"></span>
         <span>Search</span>
         <label class="rv-search-include-type-wrap">
           <input type="checkbox" class="rv-search-include-type">
@@ -2276,37 +3297,6 @@ const SHELL_HTML = `
     </div>
 
     <div class="rv-section">
-      <div class="rv-section-label">Tagged Date</div>
-      <div class="rv-date-bar"></div>
-    </div>
-
-    <div class="rv-section">
-      <div class="rv-section-label">
-        Journal Date
-        <span class="rv-col-actions">
-          <button class="rv-link rv-journal-clear">clear</button>
-        </span>
-      </div>
-      <div class="rv-journal-date-bar">
-        <div class="rv-journal-nav">
-          <button class="rv-journal-prev" title="Previous day">‹</button>
-          <span class="rv-journal-label">—</span>
-          <button class="rv-journal-next" title="Next day">›</button>
-        </div>
-        <div class="rv-journal-chips">
-          <button class="rv-chip rv-jchip" data-jdate="lastwk">last wk</button>
-          <button class="rv-chip rv-jchip" data-jdate="today">Today</button>
-          <button class="rv-chip rv-jchip" data-jdate="nextwk">next wk</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="rv-section">
-      <div class="rv-section-label">Task status</div>
-      <div class="rv-status-bar"></div>
-    </div>
-
-    <div class="rv-section">
       <div class="rv-section-label">Presets</div>
       <div class="rv-preset-list"></div>
       <div class="rv-preset-save-row">
@@ -2314,6 +3304,11 @@ const SHELL_HTML = `
         <button class="rv-preset-save" title="Save preset"><span class="ti ti-device-floppy"></span></button>
         <button class="rv-preset-edit-toggle" title="Manage presets"><span class="ti ti-trash"></span></button>
       </div>
+    </div>
+
+    <div class="rv-section">
+      <div class="rv-section-label">Filter results</div>
+      <input type="text" class="rv-search-results-filter" placeholder="Title or collection…" autocomplete="off" title="Narrows the current result list by note title or collection name (does not change the Thymer query)">
     </div>
 
     </div>
@@ -2333,7 +3328,11 @@ const SHELL_HTML = `
         </div>
         <label class="rv-dup-title-variant-wrap">
           <input type="checkbox" class="rv-dup-title-variant" checked>
-          <span>Include prefix &amp; extra words (suffix variants)</span>
+          <span>Include prefix &amp; suffix variants</span>
+        </label>
+        <label class="rv-dup-body-props-wrap">
+          <input type="checkbox" class="rv-dup-body-include-props">
+          <span>Include property fields</span>
         </label>
         <button type="button" class="rv-dup-run">Run analysis</button>
         <div class="rv-dup-filter-wrap">
@@ -2943,6 +3942,32 @@ const CSS = `
   gap: 4px;
   justify-content: center;
 }
+.rv-journal-range-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+.rv-journal-range-label {
+  opacity: 0.55;
+  font-weight: 600;
+  margin-right: 2px;
+}
+.rv-journal-range-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  opacity: 0.9;
+}
+.rv-journal-range-opt input {
+  margin: 0;
+  width: 12px;
+  height: 12px;
+}
 
 /* ── Presets (search + duplicates) ── */
 .rv-preset-list,
@@ -3051,6 +4076,28 @@ const CSS = `
 .rv-dup-preset-save:hover { background: rgba(37,99,235,0.15); border-color: #2563eb; }
 
 /* ── Mode bar & duplicate / compare sidebar ── */
+.rv-active-filters-summary {
+  font-size: 11px;
+  line-height: 1.35;
+  color: rgba(128,128,128,0.95);
+  margin: -6px 0 12px 0;
+  min-height: 1.35em;
+}
+.rv-section-active-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  margin-right: 4px;
+  font-size: 12px;
+  opacity: 0;
+  transition: opacity 0.12s;
+  vertical-align: middle;
+}
+.rv-section-active-icon--on {
+  opacity: 1;
+  color: var(--color-accent, #2563eb);
+}
 .rv-mode-bar {
   display: flex;
   gap: 4px;
@@ -3077,6 +4124,8 @@ const CSS = `
   color: #fff;
 }
 .rv-sidebar--mode-search .rv-block-dup { display: none; }
+.rv-sidebar--mode-search .rv-compare-filter-wrap,
+.rv-sidebar--mode-duplicates .rv-compare-filter-wrap { display: none; }
 .rv-sidebar--mode-duplicates .rv-block-search { display: none; }
 .rv-sidebar--mode-compare .rv-block-search { display: none; }
 .rv-sidebar--mode-compare .rv-block-dup { display: none; }
@@ -3108,6 +4157,24 @@ const CSS = `
   cursor: pointer;
 }
 .rv-dup-title-variant-wrap span { opacity: 0.88; }
+.rv-dup-body-props-wrap {
+  display: none;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  font-size: 11px;
+  line-height: 1.35;
+  cursor: pointer;
+}
+.rv-dup-body-props-wrap input {
+  margin: 0;
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.rv-dup-body-props-wrap span { opacity: 0.88; }
 .rv-dup-threshold-label {
   font-size: 10px;
   opacity: 0.55;
@@ -3143,7 +4210,8 @@ const CSS = `
   margin-bottom: 5px;
 }
 .rv-dup-filter,
-.rv-compare-filter {
+.rv-compare-filter,
+.rv-search-results-filter {
   width: 100%;
   box-sizing: border-box;
   padding: 6px 8px;
@@ -3155,7 +4223,8 @@ const CSS = `
   outline: none;
 }
 .rv-dup-filter:focus,
-.rv-compare-filter:focus {
+.rv-compare-filter:focus,
+.rv-search-results-filter:focus {
   border-color: var(--color-accent, #2563eb);
 }
 .rv-results-toolbar .rv-filter-meta {
@@ -3250,13 +4319,24 @@ const CSS = `
 }
 .rv-dup-groups { display: flex; flex-direction: column; gap: 16px; }
 .rv-dup-group-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
   font-size: 12px;
   font-weight: 600;
   margin-bottom: 6px;
   opacity: 0.85;
 }
+.rv-dup-group-head-main { flex: 1; min-width: 0; }
+.rv-dup-dismiss { flex-shrink: 0; font-size: 11px; }
 .rv-dup-group-n { opacity: 0.5; font-weight: 500; }
 .rv-results-toolbar--dup { margin-bottom: 12px; }
+.rv-results-toolbar--dup .rv-count-row {
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
 
 /* ── Compare diff ── */
 .rv-compare-diff-wrap { display: flex; flex-direction: column; gap: 12px; min-height: 200px; }
@@ -3325,7 +4405,153 @@ const CSS = `
   flex-shrink: 0;
 }
 .rv-compare-col-actions .rv-link { font-size: 11px; }
-.rv-compare-col-actions-row + .rv-diff-grid {
+.rv-compare-props-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  border: 1px solid rgba(128,128,128,0.2);
+  border-top: 1px solid rgba(128,128,128,0.15);
+  border-bottom: none;
+  overflow: hidden;
+  background: rgba(128,128,128,0.06);
+}
+.rv-compare-props-row--full {
+  grid-template-columns: 1fr;
+}
+.rv-compare-props-cell {
+  padding: 6px 10px;
+  border-right: 1px solid rgba(128,128,128,0.15);
+  min-width: 0;
+}
+.rv-compare-props-cell:last-child { border-right: none; }
+.rv-compare-props-row--full .rv-compare-props-cell { border-right: none; }
+.rv-compare-props {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.rv-compare-props-summary {
+  cursor: pointer;
+  font-weight: 600;
+  list-style: none;
+  padding: 2px 0 4px 0;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.rv-compare-props-chevron {
+  flex-shrink: 0;
+  font-size: 15px;
+  line-height: 1;
+  opacity: 0.65;
+  transition: transform 0.15s ease, opacity 0.12s;
+}
+.rv-compare-props summary:hover .rv-compare-props-chevron { opacity: 0.95; }
+details[open] > .rv-compare-props-summary .rv-compare-props-chevron {
+  transform: rotate(90deg);
+}
+.rv-compare-props-summary::-webkit-details-marker { display: none; }
+.rv-compare-props-body {
+  padding-top: 4px;
+  max-height: min(28vh, 240px);
+  overflow-y: auto;
+}
+.rv-compare-props-body--diff {
+  max-height: none;
+  overflow: visible;
+  padding-top: 2px;
+}
+.rv-diff-grid--props {
+  max-height: min(28vh, 260px);
+  overflow-y: auto;
+  border-radius: 6px;
+  font-size: 11px;
+}
+.rv-compare-props-keyed-wrap {
+  border: 1px solid rgba(128,128,128,0.2);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.rv-compare-props-keyed-head {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  border-bottom: 1px solid rgba(128,128,128,0.15);
+  background: rgba(128,128,128,0.08);
+}
+.rv-compare-props-keyed-hcell {
+  padding: 5px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  opacity: 0.8;
+  border-right: 1px solid rgba(128,128,128,0.12);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rv-compare-props-keyed-hcell:last-child { border-right: none; }
+.rv-compare-props-keyed-head--triple {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr);
+  width: 100%;
+}
+.rv-diff-grid--props-triple .rv-diff-cell.rv-diff-equal { background: rgba(128,128,128,0.04); }
+.rv-diff-grid--props-triple .rv-diff-cell.rv-diff-triple-changed--0 { background: rgba(37, 99, 235, 0.06); }
+.rv-diff-grid--props-triple .rv-diff-cell.rv-diff-triple-changed--1 { background: rgba(234, 179, 8, 0.07); }
+.rv-diff-grid--props-triple .rv-diff-cell.rv-diff-triple-changed--2 { background: rgba(34, 197, 94, 0.06); }
+.rv-diff-grid--props-triple .rv-diff-cell.rv-diff-cell--missing {
+  background: rgba(128, 128, 128, 0.05);
+  box-shadow: inset 0 0 0 1px rgba(128, 128, 128, 0.13);
+}
+.rv-diff-grid--props-triple .rv-diff-cell.rv-diff-cell--missing .rv-prop-missing {
+  opacity: 0.4;
+}
+.rv-diff-grid--props-triple .rv-diff-cell.rv-diff-cell--missing-0 {
+  box-shadow: inset 3px 0 0 rgba(37, 99, 235, 0.2), inset 0 0 0 1px rgba(128, 128, 128, 0.1);
+}
+.rv-diff-grid--props-triple .rv-diff-cell.rv-diff-cell--missing-1 {
+  box-shadow: inset 3px 0 0 rgba(234, 179, 8, 0.32), inset 0 0 0 1px rgba(128, 128, 128, 0.1);
+}
+.rv-diff-grid--props-triple .rv-diff-cell.rv-diff-cell--missing-2 {
+  box-shadow: inset 3px 0 0 rgba(34, 197, 94, 0.26), inset 0 0 0 1px rgba(128, 128, 128, 0.1);
+}
+.rv-compare-props-keyed-wrap .rv-diff-grid--props {
+  border: none;
+  border-radius: 0;
+  max-height: min(26vh, 240px);
+}
+.rv-diff-row.rv-prop-diff-mismatch .rv-diff-cell:first-child { background: rgba(37, 99, 235, 0.06); }
+.rv-diff-row.rv-prop-diff-mismatch .rv-diff-cell:last-child { background: rgba(234, 179, 8, 0.07); }
+/* Keyed props: empty side (—) — softer than mismatch / exclusive */
+.rv-diff-grid--props .rv-diff-cell.rv-diff-cell--missing {
+  background: rgba(128, 128, 128, 0.05);
+  box-shadow: inset 0 0 0 1px rgba(128, 128, 128, 0.13);
+}
+.rv-diff-grid--props .rv-diff-cell.rv-diff-cell--missing .rv-prop-missing {
+  opacity: 0.4;
+}
+.rv-diff-grid--props .rv-diff-cell.rv-diff-cell--missing-0 {
+  box-shadow: inset 3px 0 0 rgba(37, 99, 235, 0.2), inset 0 0 0 1px rgba(128, 128, 128, 0.1);
+}
+.rv-diff-grid--props .rv-diff-cell.rv-diff-cell--missing-1 {
+  box-shadow: inset 3px 0 0 rgba(234, 179, 8, 0.32), inset 0 0 0 1px rgba(128, 128, 128, 0.1);
+}
+.rv-diff-grid--props .rv-diff-del .rv-diff-cell.rv-diff-cell--missing:last-child,
+.rv-diff-grid--props .rv-diff-add .rv-diff-cell.rv-diff-cell--missing:first-child {
+  background: rgba(128, 128, 128, 0.05);
+}
+.rv-prop-missing { opacity: 0.5; font-style: italic; }
+.rv-compare-prop-line {
+  padding: 3px 0;
+  border-bottom: 1px solid rgba(128,128,128,0.1);
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+.rv-compare-prop-line:last-child { border-bottom: none; }
+.rv-compare-prop-empty { opacity: 0.55; font-style: italic; padding: 2px 0; }
+.rv-compare-props-row + .rv-diff-grid {
+  border-top: none;
   border-top-left-radius: 0;
   border-top-right-radius: 0;
 }
@@ -3339,6 +4565,23 @@ const CSS = `
   max-height: min(70vh, 720px);
   overflow-y: auto;
   font-size: 12px;
+}
+/* Three-pane keyed props: avoid display:contents (fragile); each row is its own 3-col grid */
+.rv-diff-grid.rv-diff-grid--props-triple {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.rv-diff-prop-row-triple {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr);
+  gap: 0;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+.rv-diff-prop-row-triple .rv-diff-cell {
+  min-width: 0;
 }
 .rv-diff-row {
   display: contents;
@@ -3354,10 +4597,10 @@ const CSS = `
   line-height: 1.45;
 }
 .rv-diff-equal .rv-diff-cell { background: rgba(128,128,128,0.04); }
-.rv-diff-del .rv-diff-cell:first-child { background: rgba(220,50,50,0.12); }
+.rv-diff-del .rv-diff-cell:first-child { background: rgba(37, 99, 235, 0.06); }
 .rv-diff-del .rv-diff-cell:last-child { background: rgba(128,128,128,0.04); }
 .rv-diff-add .rv-diff-cell:first-child { background: rgba(128,128,128,0.04); }
-.rv-diff-add .rv-diff-cell:last-child { background: rgba(34,197,94,0.12); }
+.rv-diff-add .rv-diff-cell:last-child { background: rgba(234, 179, 8, 0.07); }
 .rv-diff-triple {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -3368,8 +4611,51 @@ const CSS = `
 }
 @media (max-width: 900px) {
   .rv-diff-triple { grid-template-columns: 1fr; }
+  .rv-diff-triple--keyed-props { grid-template-columns: 1fr; }
+}
+.rv-diff-triple--keyed-props {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  align-items: start;
+  max-height: min(70vh, 720px);
+  overflow: auto;
+}
+.rv-diff-triple-props-span {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+/* One shared grid for body: each diff row is a single grid row so column heights stay aligned */
+.rv-diff-triple-body-span {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+.rv-diff-triple-body-sync {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr);
+  align-items: stretch;
+  justify-items: stretch;
+  gap: 0;
+  border: 1px solid rgba(128,128,128,0.2);
+  border-radius: 8px;
+  overflow: hidden;
+  max-height: min(60vh, 520px);
+  overflow-y: auto;
+}
+.rv-diff-triple-body-sync .rv-diff-col-line {
+  border-right: 1px solid rgba(128,128,128,0.12);
+}
+.rv-diff-triple-body-sync .rv-diff-col-line:nth-child(3n) {
+  border-right: none;
+}
+.rv-diff-triple-head-cell { min-width: 0; }
+.rv-diff-triple-head-cell .rv-diff-col-head {
+  border: 1px solid rgba(128,128,128,0.2);
+  border-radius: 8px;
 }
 .rv-diff-col {
+  display: flex;
+  flex-direction: column;
   border: 1px solid rgba(128,128,128,0.2);
   border-radius: 8px;
   overflow: hidden;
@@ -3384,6 +4670,11 @@ const CSS = `
 .rv-diff-col-head .rv-compare-actions-block {
   width: 100%;
 }
+.rv-diff-col-props {
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(128,128,128,0.12);
+  background: rgba(128,128,128,0.04);
+}
 .rv-diff-col-body {
   margin: 0;
   padding: 8px 10px;
@@ -3394,4 +4685,28 @@ const CSS = `
   max-height: 60vh;
   overflow-y: auto;
 }
+/* Two-pane compare: body + keyed properties use blue / amber / gray (see .rv-diff-* / .rv-prop-diff-mismatch). */
+/* Three-pane: neutral chrome; body uses per-line tints (same hues as two-pane + green for column 3). */
+.rv-diff-col-body-wrap {
+  flex: 1;
+  min-height: 0;
+  max-height: 60vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.rv-diff-col-line {
+  margin: 0;
+  padding: 4px 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  border-bottom: 1px solid rgba(128,128,128,0.1);
+}
+.rv-diff-col-line.rv-diff-equal { background: rgba(128,128,128,0.04); }
+.rv-diff-col-line.rv-diff-triple-changed--0 { background: rgba(37, 99, 235, 0.06); }
+.rv-diff-col-line.rv-diff-triple-changed--1 { background: rgba(234, 179, 8, 0.07); }
+.rv-diff-col-line.rv-diff-triple-changed--2 { background: rgba(34, 197, 94, 0.06); }
 `;
