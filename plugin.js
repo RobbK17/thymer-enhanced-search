@@ -1,10 +1,10 @@
 /**
- * Enhanced Search — Thymer plugin v1.1.5
+ * Enhanced Search — Thymer plugin v1.1.7
  * Cross-collection record viewer with filters (see README).
  * Modes: Search, Duplicates (analysis), Compare (2–3 notes + diff).
  */
 const PLUGIN_NAME = 'Enhanced Search';
-const PLUGIN_VERSION = '1.1.5';
+const PLUGIN_VERSION = '1.1.7';
 
 /** Skip duplicate/similar scans above this many records (per selected collections). */
 const DUPLICATE_SCAN_MAX_RECORDS = 2500;
@@ -34,7 +34,7 @@ function _journalDaysForRange(anchor, range) {
     return [-1, 0, 1, 2, 3, 4, 5, 6].map(off => {
       const d = new Date(d0);
       d.setDate(d.getDate() + off);
-      return d;
+      return d;a
     });
   }
   return [d0];
@@ -44,8 +44,8 @@ class Plugin extends AppPlugin {
   /** Enhanced Search viewer panels by `panel.getId()` (refs from getPanels() may differ from register callback). */
   _viewerPanelsById = new Map();
   _collections = [];  // cache of PluginCollectionAPI[]
-  /** Full result list from last search (for pagination). */
-  _matchRecords = null;
+  /** Flat line-level hits from last search: `{ record, lineItem }` (`lineItem` null = record-only). Merged by record for display. */
+  _matchRows = null;
   /** Index of first record on the current page (0, then +pageSize each Load next). */
   _pageStart = 0;
   _pageSize = 50;
@@ -65,6 +65,9 @@ class Plugin extends AppPlugin {
   _compareDiffOpen = false;
   /** Which sidebar mode was active when **Open compare** was used (`search` | `duplicates` | `compare`) — drives Back label and navigation. */
   _compareBackFrom = 'compare';
+  /** Snapshots of sidebar controls when leaving Search vs Duplicates so the shared DOM does not mix the two modes. */
+  _sidebarSearchStateCache = null;
+  _sidebarDupStateCache = null;
 
   // ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -198,8 +201,15 @@ class Plugin extends AppPlugin {
       statusBar.appendChild(btn);
     });
 
-    // Date chips
+    // Date chips — All sends `@task` in the query; then Today, Tomorrow, …
     const dateBar = el.querySelector('.rv-date-bar');
+    const allDateBtn = document.createElement('button');
+    allDateBtn.type = 'button';
+    allDateBtn.className = 'rv-chip';
+    allDateBtn.dataset.date = '@task';
+    allDateBtn.textContent = 'All';
+    allDateBtn.title = 'Tasks (@task)';
+    dateBar.appendChild(allDateBtn);
     DATE_FILTERS.forEach(d => {
       const btn = document.createElement('button');
       btn.className = 'rv-chip';
@@ -362,25 +372,26 @@ class Plugin extends AppPlugin {
   /** Client-side filter on current match list (title or collection substring). */
   _getSearchFilteredRecords(el) {
     const raw = el.querySelector('.rv-search-results-filter')?.value ?? '';
-    return _filterRecordsForCompareDisplay(this._matchRecords || [], raw, this._recordColMap);
+    return _filterSearchRows(this._matchRows || [], raw, this._recordColMap);
   }
 
   async _copyResultListToClipboard(el) {
-    let records;
+    let flatRows;
     if (this._panelMode === 'compare') {
       const filterRaw = el.querySelector('.rv-compare-filter')?.value ?? '';
-      records = _filterRecordsForCompareDisplay(
-        this._matchRecords || [],
+      flatRows = _filterSearchRows(
+        this._matchRows || [],
         filterRaw,
         this._recordColMap
       ).filtered;
     } else if (this._panelMode === 'search') {
-      records = this._getSearchFilteredRecords(el).filtered;
+      flatRows = this._getSearchFilteredRecords(el).filtered;
     } else {
       return;
     }
-    if (!records.length) return;
-    const text = _formatRecordListForClipboard(records, this._recordColMap);
+    if (!flatRows.length) return;
+    const merged = _mergeSearchRowsByRecord(flatRows);
+    const text = _formatSearchRowsForClipboard(merged, this._recordColMap);
     try {
       await navigator.clipboard.writeText(text);
     } catch {
@@ -403,17 +414,21 @@ class Plugin extends AppPlugin {
     const sortMode = this._captureSortMode(el);
     const results = el.querySelector('.rv-results');
     if (!results) return;
-    const list = this._matchRecords;
+    const list = this._matchRows;
     if (!list?.length) return;
     const selectedGuids = new Set(
       [...el.querySelectorAll('.rv-col-list input:checked')].map(cb => cb.dataset.colGuid)
     );
     const filterRaw = el.querySelector('.rv-search-results-filter')?.value ?? '';
-    const { filtered: visible, totalBeforeFilter } = _filterRecordsForCompareDisplay(
+    const { filtered: visibleFlat, totalBeforeFilter } = _filterSearchRows(
       list,
       filterRaw,
       this._recordColMap
     );
+    const visible = _mergeSearchRowsByRecord(visibleFlat);
+    const totalBeforeMerged = String(filterRaw || '').trim()
+      ? _mergeSearchRowsByRecord(list).length
+      : visible.length;
     if (!visible.length) {
       if (totalBeforeFilter > 0) {
         results.innerHTML = `<div class="rv-empty"><span class="ti ti-search-off"></span><div>No notes match filter</div><div class="rv-empty-sub">${totalBeforeFilter} hidden — clear Filter results</div></div>`;
@@ -427,9 +442,18 @@ class Plugin extends AppPlugin {
     const firstBatch = visible.slice(this._pageStart, this._pageStart + this._pageSize);
     const hasFilter = String(filterRaw || '').trim().length > 0;
     const toolbarOpts =
-      hasFilter && totalBeforeFilter > total ? { listFilterTotalBefore: totalBeforeFilter } : {};
+      hasFilter && totalBeforeMerged > total ? { listFilterTotalBefore: totalBeforeMerged } : {};
+    const activeTaskStatuses = _activeTaskStatusSet(el);
+    const searchRaw = el.querySelector('.rv-search-input')?.value ?? '';
+    const highlightTerms = _plainSearchHighlightTermsFromQuery(searchRaw);
     const cards = await Promise.all(
-      firstBatch.map(r => this._buildCard(r, selectedGuids, expandPreview, { compareBtn: true }))
+      firstBatch.map(row =>
+        this._buildCard(row, selectedGuids, expandPreview, {
+          compareBtn: true,
+          activeTaskStatuses,
+          highlightTerms,
+        })
+      )
     );
     const validCards = cards.filter(Boolean);
     const toolbar = _resultsToolbarHtml(
@@ -456,17 +480,17 @@ class Plugin extends AppPlugin {
     let total;
     if (this._panelMode === 'compare') {
       const filterRaw = el.querySelector('.rv-compare-filter')?.value ?? '';
-      const { filtered } = _filterRecordsForCompareDisplay(
-        this._matchRecords || [],
+      const { filtered } = _filterSearchRows(
+        this._matchRows || [],
         filterRaw,
         this._recordColMap
       );
-      total = filtered.length;
+      total = _mergeSearchRowsByRecord(filtered).length;
     } else if (this._panelMode === 'search') {
       const { filtered } = this._getSearchFilteredRecords(el);
-      total = filtered.length;
+      total = _mergeSearchRowsByRecord(filtered).length;
     } else {
-      const list = this._matchRecords;
+      const list = this._matchRows;
       if (!list || !list.length) return;
       total = list.length;
     }
@@ -534,6 +558,16 @@ class Plugin extends AppPlugin {
     }
   }
 
+  /** Clear tagged date and journal when user types search text (task status stays; combines with query). Does not run search. */
+  _clearSidebarFiltersForTextSearch(el) {
+    el.querySelectorAll('.rv-date-bar .rv-chip').forEach(c => c.classList.remove('rv-chip--active'));
+    this._journalDate = null;
+    const jl = el.querySelector('.rv-journal-label');
+    if (jl) jl.textContent = '—';
+    el.querySelectorAll('.rv-jchip').forEach(c => c.classList.remove('rv-chip--active'));
+    this._syncJournalRangeRadios(el, 'single');
+  }
+
   _presetsKey() { return 'rv_presets_' + this.getWorkspaceGuid(); }
 
   _dupPresetsKey() { return 'rv_dup_presets_' + this.getWorkspaceGuid(); }
@@ -570,7 +604,7 @@ class Plugin extends AppPlugin {
     };
   }
 
-  async _applyDupState(el, state) {
+  _applyDupStateToDom(el, state) {
     const kinds = ['title_exact', 'title_similar', 'content_exact', 'content_similar'];
     const kind = kinds.includes(state.kind) ? state.kind : 'title_similar';
     const sel = el.querySelector('.rv-dup-kind');
@@ -594,7 +628,14 @@ class Plugin extends AppPlugin {
     });
     this._updateTypeSearchCheckboxVisibility(el);
     this._syncDupKindUI(el);
-    await this._setPanelMode(el, 'duplicates', { forceDup: true });
+  }
+
+  async _applyDupState(el, state) {
+    this._applyDupStateToDom(el, state);
+    await this._setPanelMode(el, 'duplicates', { forceDup: true, skipDupCacheRestore: true });
+    try {
+      this._sidebarDupStateCache = this._getDupState(el);
+    } catch { /* ignore */ }
   }
 
   _getFilterState(el) {
@@ -713,6 +754,11 @@ class Plugin extends AppPlugin {
     const searchInput = el.querySelector('.rv-search-input');
     searchInput.addEventListener('input', () => {
       this._syncSearchClear(el);
+      if (searchInput.value.trim().length > 0) {
+        this._clearSidebarFiltersForTextSearch(el);
+        this._updateActiveSearchIndicators(el);
+        searchInput.focus();
+      }
       clearTimeout(debounce);
       debounce = setTimeout(() => this._runSearch(el), 400);
     });
@@ -736,7 +782,7 @@ class Plugin extends AppPlugin {
       this._runSearch(el);
     });
 
-    // Tagged date chips — single select (exclusive with task status + journal day mode)
+    // Tagged date chips — single-select (All = @task); exclusive with task status + journal day mode
     el.querySelector('.rv-date-bar').addEventListener('click', e => {
       const chip = e.target.closest('.rv-chip');
       if (!chip) return;
@@ -747,10 +793,11 @@ class Plugin extends AppPlugin {
       this._runSearch(el);
     });
 
-    el.querySelector('.rv-tagged-date-clear')?.addEventListener('click', () => {
+    const clearTaggedDate = () => {
       el.querySelectorAll('.rv-date-bar .rv-chip').forEach(c => c.classList.remove('rv-chip--active'));
       this._runSearch(el);
-    });
+    };
+    el.querySelector('.rv-tagged-date-clear')?.addEventListener('click', clearTaggedDate);
 
     el.querySelector('.rv-task-status-clear')?.addEventListener('click', () => {
       el.querySelectorAll('.rv-status-bar .rv-chip').forEach(c => c.classList.remove('rv-chip--active'));
@@ -848,7 +895,12 @@ class Plugin extends AppPlugin {
       const delBtn  = e.target.closest('.rv-preset-del');
       if (loadBtn) {
         const idx = parseInt(loadBtn.dataset.index);
-        if (!isNaN(idx)) this._applyFilterState(el, this._getPresets()[idx].state);
+        if (!isNaN(idx)) {
+          this._applyFilterState(el, this._getPresets()[idx].state);
+          try {
+            this._sidebarSearchStateCache = this._getFilterState(el);
+          } catch { /* ignore */ }
+        }
       } else if (delBtn) {
         const idx = parseInt(delBtn.dataset.index);
         if (isNaN(idx)) return;
@@ -906,8 +958,8 @@ class Plugin extends AppPlugin {
       const v = e.target.value;
       if (!['modified', 'title', 'collection_modified'].includes(v)) return;
       try { localStorage.setItem(this._sortStorageKey(), v); } catch { /* ignore */ }
-      if (this._isJournalResults || !this._matchRecords?.length) return;
-      this._matchRecords = _sortRecordsForDisplay(this._matchRecords, v, this._recordColMap);
+      if (this._isJournalResults || !this._matchRows?.length) return;
+      this._matchRows = _sortSearchRows(this._matchRows, v, this._recordColMap);
       this._pageStart = 0;
       this._renderCurrentPage(el);
     });
@@ -971,7 +1023,7 @@ class Plugin extends AppPlugin {
     el.querySelector('.rv-search-results-filter')?.addEventListener('input', () => {
       clearTimeout(searchResultsFilterDebounce);
       searchResultsFilterDebounce = setTimeout(() => {
-        if (this._panelMode === 'search' && this._matchRecords?.length) {
+        if (this._panelMode === 'search' && this._matchRows?.length) {
           this._pageStart = 0;
           void this._renderSearchPageFromMatchRecords(el);
         }
@@ -992,12 +1044,22 @@ class Plugin extends AppPlugin {
   /**
    * @param {object} [opts]
    * @param {boolean} [opts.forceDup] — When switching to Duplicates, always run analysis (e.g. dup preset load).
+   * @param {boolean} [opts.skipDupCacheRestore] — Duplicates DOM already set (e.g. dup preset); do not overlay cached dup state.
    */
   async _setPanelMode(el, mode, opts = {}) {
     if (!['search', 'duplicates', 'compare'].includes(mode)) return;
     this._compareDiffOpen = false;
 
     if (mode === 'compare') {
+      if (this._panelMode === 'search') {
+        try {
+          this._sidebarSearchStateCache = this._getFilterState(el);
+        } catch { /* ignore */ }
+      } else if (this._panelMode === 'duplicates') {
+        try {
+          this._sidebarDupStateCache = this._getDupState(el);
+        } catch { /* ignore */ }
+      }
       await this._runSearch(el, { ignoreMode: true });
       this._panelMode = 'compare';
       this._applyPanelMode(el);
@@ -1005,11 +1067,28 @@ class Plugin extends AppPlugin {
       return;
     }
 
+    if (mode === 'search' && this._panelMode === 'duplicates') {
+      try {
+        this._sidebarDupStateCache = this._getDupState(el);
+      } catch { /* ignore */ }
+    } else if (mode === 'duplicates' && this._panelMode === 'search') {
+      try {
+        this._sidebarSearchStateCache = this._getFilterState(el);
+      } catch { /* ignore */ }
+    }
+
     this._panelMode = mode;
     this._applyPanelMode(el);
     if (mode === 'search') {
-      await this._runSearch(el);
+      if (this._sidebarSearchStateCache) {
+        this._applyFilterState(el, this._sidebarSearchStateCache);
+      } else {
+        await this._runSearch(el);
+      }
     } else if (mode === 'duplicates') {
+      if (!opts.skipDupCacheRestore && this._sidebarDupStateCache) {
+        this._applyDupStateToDom(el, this._sidebarDupStateCache);
+      }
       const shouldDupRefresh = this._dupGroups != null;
       this._dupDismissedKeys.clear();
       this._dupGroups = null;
@@ -1064,16 +1143,20 @@ class Plugin extends AppPlugin {
     if (this._panelMode !== 'compare') return;
     const results = el.querySelector('.rv-results');
     if (!results) return;
-    if (!this._matchRecords?.length) {
+    if (!this._matchRows?.length) {
       results.innerHTML = `<div class="rv-empty"><span class="ti ti-columns"></span><div>No results to compare</div><div class="rv-empty-sub">Switch to Search, run a query, then return here and use + on cards</div></div>`;
       return;
     }
     const filterRaw = el.querySelector('.rv-compare-filter')?.value ?? '';
-    const { filtered: visible, totalBeforeFilter } = _filterRecordsForCompareDisplay(
-      this._matchRecords,
+    const { filtered: visibleFlat, totalBeforeFilter } = _filterSearchRows(
+      this._matchRows,
       filterRaw,
       this._recordColMap
     );
+    const visible = _mergeSearchRowsByRecord(visibleFlat);
+    const totalBeforeMerged = String(filterRaw || '').trim()
+      ? _mergeSearchRowsByRecord(this._matchRows).length
+      : visible.length;
     if (!visible.length) {
       results.innerHTML = `<div class="rv-empty"><span class="ti ti-search-off"></span><div>No notes match filter</div><div class="rv-empty-sub">${totalBeforeFilter} hidden — clear Filter list</div></div>`;
       return;
@@ -1087,8 +1170,15 @@ class Plugin extends AppPlugin {
     const firstBatch = visible.slice(this._pageStart, this._pageStart + this._pageSize);
     const hasFilter = String(filterRaw || '').trim().length > 0;
     const toolbarOpts =
-      hasFilter && totalBeforeFilter > total ? { listFilterTotalBefore: totalBeforeFilter } : {};
-    Promise.all(firstBatch.map(r => this._buildCard(r, selectedGuids, false, { compareBtn: true }))).then(cards => {
+      hasFilter && totalBeforeMerged > total ? { listFilterTotalBefore: totalBeforeMerged } : {};
+    const activeTaskStatuses = _activeTaskStatusSet(el);
+    const searchRaw = el.querySelector('.rv-search-input')?.value ?? '';
+    const highlightTerms = _plainSearchHighlightTermsFromQuery(searchRaw);
+    Promise.all(
+      firstBatch.map(row =>
+        this._buildCard(row, selectedGuids, false, { compareBtn: true, activeTaskStatuses, highlightTerms })
+      )
+    ).then(cards => {
       const validCards = cards.filter(Boolean);
       const toolbar = _resultsToolbarHtml(
         this._pageStart,
@@ -1216,7 +1306,9 @@ class Plugin extends AppPlugin {
     const buildGroup = async g => {
       const key = _dupGroupKey(g);
       const keyAttr = encodeURIComponent(key);
-      const cards = await Promise.all(g.records.map(r => this._buildCard(r, selectedGuids, false, { compareBtn: true })));
+      const cards = await Promise.all(
+        g.records.map(r => this._buildCard({ record: r, lineItems: [] }, selectedGuids, false, { compareBtn: true }))
+      );
       const valid = cards.filter(Boolean);
       return `<div class="rv-dup-group">
   <div class="rv-dup-group-head">
@@ -1323,7 +1415,7 @@ class Plugin extends AppPlugin {
 
   /**
    * One-line summary under the mode bar + check icons on filter section labels.
-   * Reflects current sidebar state (text can combine with at most one of tagged / journal / status).
+   * Search text can combine with task status; tagged date, journal, and task status remain mutually exclusive in the sidebar.
    */
   _updateActiveSearchIndicators(el) {
     const sumEl = el.querySelector('.rv-active-filters-summary');
@@ -1376,7 +1468,35 @@ class Plugin extends AppPlugin {
   }
 
   /**
-   * @param {{ ignoreMode?: boolean }} [opts] - If true, refresh `_matchRecords` only (no search result DOM); used when switching to Compare from any mode so the compare list uses up-to-date query results.
+   * Human-readable filter summary for empty-result copy (e.g. `tagged date — All · search: foo`).
+   */
+  _describeSearchFiltersForEmpty(el) {
+    const parts = [];
+    const raw = el.querySelector('.rv-search-input')?.value?.trim() ?? '';
+    if (raw) {
+      const short = raw.length > 100 ? raw.slice(0, 97) + '…' : raw;
+      parts.push(`search: ${short}`);
+    }
+    const taggedChip = el.querySelector('.rv-date-bar .rv-chip--active');
+    if (taggedChip) {
+      const label = taggedChip.textContent?.trim() || taggedChip.dataset.date || 'Tagged date';
+      parts.push(`tagged date — ${label}`);
+    }
+    const statusChips = [...el.querySelectorAll('.rv-status-bar .rv-chip--active')];
+    if (statusChips.length) {
+      const names = statusChips.map(c => String(c.textContent || '').trim()).filter(Boolean).join(', ');
+      if (names) parts.push(`task status — ${names}`);
+    }
+    if (el.querySelector('.rv-search-include-type')?.checked) {
+      parts.push('include #types');
+    }
+    const nCol = el.querySelectorAll('.rv-col-list input:checked').length;
+    if (nCol > 0) parts.push(`${nCol} collection${nCol === 1 ? '' : 's'}`);
+    return parts.length ? parts.join(' · ') : '';
+  }
+
+  /**
+   * @param {{ ignoreMode?: boolean }} [opts] - If true, refresh `_matchRows` only (no search result DOM); used when switching to Compare from any mode so the compare list uses up-to-date query results.
    */
   async _runSearch(el, opts = {}) {
     if (!opts.ignoreMode && this._panelMode !== 'search') return;
@@ -1424,7 +1544,7 @@ class Plugin extends AppPlugin {
     // If no collections selected, show empty (unless Thymer query already scopes @collection=…)
     if (selectedGuids.size === 0) {
       if (!thymerCollectionScope || !raw.trim()) {
-        this._matchRecords = [];
+        this._matchRows = [];
         if (!opts.ignoreMode) {
           results.innerHTML = `<div class="rv-empty"><span class="ti ti-filter-off"></span><div>No collections selected</div></div>`;
         }
@@ -1465,7 +1585,7 @@ class Plugin extends AppPlugin {
       }
       const filtered = this._filterJournalDateRecords(merged);
       if (filtered.length === 0) {
-        this._matchRecords = [];
+        this._matchRows = [];
         if (!opts.ignoreMode) {
           if (range === 'single') {
             results.innerHTML = `<div class="rv-empty"><span class="ti ti-calendar-off"></span><div>No journal entry for this date</div></div>`;
@@ -1475,20 +1595,20 @@ class Plugin extends AppPlugin {
         }
         return;
       }
-      this._matchRecords = filtered;
+      this._matchRows = filtered.map(r => ({ record: r, lineItem: null }));
       this._isJournalResults = true;
       this._pageStart = 0;
       if (!opts.ignoreMode) await this._renderSearchPageFromMatchRecords(el);
       return;
     }
 
-    let records = [];
+    let rows = [];
 
     if (!query) {
       // No filters active — pull directly from pre-built map, filtered by selected collections
       const allGuids = Object.keys(this._recordColMap)
         .filter(guid => selectedGuids.has(this._recordColMap[guid].colGuid));
-      records = allGuids.map(guid => this.data.getRecord(guid)).filter(Boolean);
+      rows = allGuids.map(guid => this.data.getRecord(guid)).filter(Boolean).map(r => ({ record: r, lineItem: null }));
     } else {
       // Run search query then filter to selected collections
       const includeTypeSearch =
@@ -1499,24 +1619,32 @@ class Plugin extends AppPlugin {
         && query.trim().length > 0
         && (textsForType.length > 0 || tagsForType.length > 0);
 
-      const addSearchResults = (searchResults, seen) => {
-        for (const record of searchResults.records || []) {
-          if (!record || seen.has(record.guid)) continue;
-          seen.add(record.guid);
-          records.push(record);
-        }
+      /** Line hits first (one row per line); record-only hits for pages with no line match. */
+      const mergeSearchResultRows = searchResults => {
+        const guidsWithLineHits = new Set();
         for (const li of searchResults.lines || []) {
           const record = li.getRecord();
-          if (!record || seen.has(record.guid)) continue;
-          seen.add(record.guid);
-          records.push(record);
+          if (record) guidsWithLineHits.add(record.guid);
         }
+        const out = [];
+        for (const li of searchResults.lines || []) {
+          const record = li.getRecord();
+          if (!record) continue;
+          out.push({ record, lineItem: li });
+        }
+        for (const record of searchResults.records || []) {
+          if (!record) continue;
+          if (guidsWithLineHits.has(record.guid)) continue;
+          out.push({ record, lineItem: null });
+        }
+        return out;
       };
 
       try {
         const searchResults = await this.data.searchByQuery(query, 500);
+        rows = mergeSearchResultRows(searchResults);
         const seen = new Set();
-        addSearchResults(searchResults, seen);
+        for (const row of rows) seen.add(row.record.guid);
 
         // Type-field merges only match words/#tags; they must also satisfy task + tagged date
         // (same tokens run alone through Thymer), or they would bypass @today / @due / status.
@@ -1532,11 +1660,11 @@ class Plugin extends AppPlugin {
             if (seen.has(r.guid)) continue;
             if (filterSetForTypeMerge && !filterSetForTypeMerge.has(r.guid)) continue;
             seen.add(r.guid);
-            records.push(r);
+            rows.push({ record: r, lineItem: null });
           }
         }
       } catch (err) {
-        this._matchRecords = [];
+        this._matchRows = [];
         if (!opts.ignoreMode) {
           results.innerHTML = `<div class="rv-empty"><span class="ti ti-alert-triangle"></span><div>${_esc(err.message)}</div></div>`;
         }
@@ -1545,40 +1673,47 @@ class Plugin extends AppPlugin {
 
       // Filter to selected collections (skip when query uses @collection=… for Thymer-side scope)
       if (this._filterRecordsByCollectionCheckboxes) {
-        records = records.filter(r => {
-          const meta = this._recordColMap[r.guid];
+        rows = rows.filter(row => {
+          const meta = this._recordColMap[row.record.guid];
           return meta && selectedGuids.has(meta.colGuid);
         });
       } else {
-        records = records.filter(r => this._recordColMap[r.guid]);
+        rows = rows.filter(row => this._recordColMap[row.record.guid]);
       }
     }
 
     // Drop journal records with no real "Last modified" (same as UI "—"); those are empty journal shells.
-    const filtered = records.filter(
-      r => !(this._isJournalCollectionRecord(r) && _isBlankLastModified(r))
+    const filtered = rows.filter(
+      row => !(this._isJournalCollectionRecord(row.record) && _isBlankLastModified(row.record))
     );
 
     if (filtered.length === 0) {
-      this._matchRecords = [];
+      this._matchRows = [];
       if (!opts.ignoreMode) {
-        results.innerHTML = `<div class="rv-empty"><span class="ti ti-search-off"></span><div>No records found</div><div class="rv-empty-sub">Try adjusting your filters</div></div>`;
+        const detail = this._describeSearchFiltersForEmpty(el);
+        const sub = detail
+          ? `for: ${_esc(detail)}`
+          : 'Try adjusting your filters';
+        results.innerHTML = `<div class="rv-empty"><span class="ti ti-search-off"></span><div>No records found</div><div class="rv-empty-sub">${sub}</div></div>`;
       }
       return;
     }
 
-    const sorted = _sortRecordsForDisplay(filtered, sortMode, this._recordColMap);
-    this._matchRecords = sorted;
+    const sorted = _sortSearchRows(filtered, sortMode, this._recordColMap);
+    this._matchRows = sorted;
     this._isJournalResults = false;
     this._pageStart = 0;
     if (!opts.ignoreMode) await this._renderSearchPageFromMatchRecords(el);
   }
 
   /**
+   * @param {{ record: object, lineItems?: object[] }} row - Merged hit: `lineItems` = matching lines (empty = record-only).
    * @param {boolean} [expandPreview] - When true (journal date mode), card starts with preview expanded.
-   * @param {{ compareBtn?: boolean }} [opts]
+   * @param {{ compareBtn?: boolean, activeTaskStatuses?: Set<string>, highlightTerms?: string[]|null }} [opts] - `activeTaskStatuses` drives Done-filter checkbox styling on hit lines; `highlightTerms` highlights plain search words in hit lines.
    */
-  async _buildCard(record, selectedGuids, expandPreview = false, opts = {}) {
+  async _buildCard(row, selectedGuids, expandPreview = false, opts = {}) {
+    const record = row.record;
+    const lineItems = Array.isArray(row.lineItems) ? row.lineItems : [];
     // Fast O(1) lookup using pre-built map
     const meta = this._recordColMap[record.guid];
     const colName = meta ? meta.colName : '';
@@ -1588,7 +1723,9 @@ class Plugin extends AppPlugin {
     // Filter by sidebar collections (skipped when search used @collection=…)
     if (this._filterRecordsByCollectionCheckboxes && colGuid && !selectedGuids.has(colGuid)) return null;
 
-    // Full text excerpt for expanded preview (many lines)
+    const hitTexts = lineItems.map(li => _lineItemPlainText(li)).filter(Boolean);
+
+    // Full text excerpt for expanded preview (many lines); prioritize matching lines when present
     const previewChunks = [];
     try {
       const lines = await record.getLineItems(false);
@@ -1605,6 +1742,13 @@ class Plugin extends AppPlugin {
         if (previewChunks.length >= PREVIEW_MAX_LINE_ITEMS) break;
       }
     } catch { /* no preview */ }
+    if (hitTexts.length) {
+      const hitSet = new Set(hitTexts);
+      const rest = previewChunks.filter(c => !hitSet.has(c));
+      previewChunks.length = 0;
+      const cap = Math.max(0, PREVIEW_MAX_LINE_ITEMS - hitTexts.length);
+      previewChunks.push(...hitTexts, ...rest.slice(0, cap));
+    }
     const previewText = previewChunks.join('\n\n');
 
     const updatedAt = record.getUpdatedAt();
@@ -1644,6 +1788,27 @@ class Plugin extends AppPlugin {
       ? `<button type="button" class="rv-card-compare-add" data-record-guid="${record.guid}" title="Add to compare">+</button>`
       : '';
 
+    const taskStatusSet = opts.activeTaskStatuses instanceof Set ? opts.activeTaskStatuses : new Set();
+    const highlightTerms = Array.isArray(opts.highlightTerms) && opts.highlightTerms.length ? opts.highlightTerms : null;
+    const hitLineRows = lineItems
+      .map(li => {
+        const t = _lineItemPlainText(li);
+        if (!t) return '';
+        const icon = _lineItemHitCheckboxIcon(li, taskStatusSet);
+        const checkWrap = icon
+          ? `<span class="rv-card-hit-check-wrap" aria-hidden="true"><span class="ti ${icon}"></span></span>`
+          : '';
+        const display = highlightTerms
+          ? _truncateDisplayWithSearchHighlight(t, 220, highlightTerms)
+          : _truncateDisplay(t, 220);
+        const hitHtml = highlightTerms
+          ? _highlightPlainSearchTermsInText(display, highlightTerms)
+          : _esc(display);
+        return `<div class="rv-card-hit-line">${checkWrap}<span class="rv-card-hit-line-text">${hitHtml}</span></div>`;
+      })
+      .filter(Boolean);
+    const hitLineBlock = hitLineRows.length ? `<div class="rv-card-hit-lines">${hitLineRows.join('')}</div>` : '';
+
     const openClass = expandPreview ? ' rv-card--preview-open' : '';
     return `
 <div class="rv-card has-expandable${openClass}" data-record-guid="${record.guid}">
@@ -1656,6 +1821,7 @@ class Plugin extends AppPlugin {
       <div class="rv-card-one-line">
         <span class="rv-card-title">${_esc(name)}</span><span class="rv-card-col-bracket"> [${_esc(_truncateDisplay(colName, COLLECTION_NAME_IN_CARD_MAX))}]</span>${timePart}
       </div>
+      ${hitLineBlock}
     </div>
     ${compareBtn}
   </div>
@@ -1787,7 +1953,6 @@ class Plugin extends AppPlugin {
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const TASK_STATUSES = [
-  { value: 'task',      label: 'All tasks',  color: '#94a3b8' },
   { value: 'done',      label: 'Done',       color: '#22c55e' },
   { value: 'started',   label: 'Started',    color: '#3b82f6' },
   { value: 'important', label: 'Important',  color: '#f97316' },
@@ -1977,18 +2142,18 @@ function _cmpCollectionThenModified(a, b, recordColMap) {
 }
 
 /**
- * Stable sort for result list (mixed collections including journals).
+ * Stable sort for search result rows (by parent record fields; multiple line hits per record stay in relative order).
  * @param {'modified'|'title'|'collection_modified'} mode
  */
-function _sortRecordsForDisplay(records, mode, recordColMap) {
+function _sortSearchRows(rows, mode, recordColMap) {
   const m = _SORT_MODES.includes(mode) ? mode : 'modified';
-  const out = [...records];
+  const out = [...rows];
   if (m === 'title') {
-    out.sort(_cmpTitleAsc);
+    out.sort((a, b) => _cmpTitleAsc(a.record, b.record));
   } else if (m === 'collection_modified') {
-    out.sort((a, b) => _cmpCollectionThenModified(a, b, recordColMap));
+    out.sort((a, b) => _cmpCollectionThenModified(a.record, b.record, recordColMap));
   } else {
-    out.sort(_cmpModifiedDesc);
+    out.sort((a, b) => _cmpModifiedDesc(a.record, b.record));
   }
   return out;
 }
@@ -3172,30 +3337,205 @@ function _dupGroupKey(g) {
 }
 
 /**
- * Client-side filter for compare-mode result list (case-insensitive substring).
- * Matches note title or collection name from `recordColMap`.
- * @returns {{ filtered: object[], totalBeforeFilter: number }}
+ * Collapse flat search hits into one card per record; `lineItems` collects all line hits in visit order.
+ * @param {{ record: object, lineItem: object|null }[]} flatRows
+ * @returns {{ record: object, lineItems: object[] }[]}
  */
-function _filterRecordsForCompareDisplay(records, filterText, recordColMap) {
-  const totalBeforeFilter = records.length;
+function _mergeSearchRowsByRecord(flatRows) {
+  const map = new Map();
+  const order = [];
+  for (const row of flatRows) {
+    const g = row.record.guid;
+    if (!map.has(g)) {
+      map.set(g, { record: row.record, lineItems: [] });
+      order.push(g);
+    }
+    if (row.lineItem) map.get(g).lineItems.push(row.lineItem);
+  }
+  return order.map(g => map.get(g));
+}
+
+/**
+ * Plain text for a line hit (segments with string text, including dates on tasks).
+ */
+function _lineItemPlainText(li) {
+  if (!li?.segments?.length) return '';
+  const parts = [];
+  for (const s of li.segments) {
+    if (typeof s.text === 'string') parts.push(s.text);
+  }
+  return parts.join('').trim();
+}
+
+function _escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Case-insensitive substring matches for hit-line highlights (includes partial words).
+ * Longest terms first so longer tokens win when one contains another (e.g. "foo" vs "foobar").
+ */
+function _searchHighlightSubstringRegex(terms) {
+  const sorted = [...terms].filter(Boolean).sort((a, b) => b.length - a.length);
+  if (!sorted.length) return /$^/;
+  const pattern = sorted.map(t => _escapeRegExp(t)).join('|');
+  try {
+    return new RegExp(`(${pattern})`, 'giu');
+  } catch {
+    return new RegExp(`(${pattern})`, 'gi');
+  }
+}
+
+/** Earliest character index where any term matches as a substring (case-insensitive). */
+function _firstSubstringMatchIndex(str, terms) {
+  const s = String(str ?? '');
+  const lower = s.toLowerCase();
+  let best = -1;
+  for (const t of terms) {
+    if (!t) continue;
+    const idx = lower.indexOf(t.toLowerCase());
+    if (idx !== -1 && (best === -1 || idx < best)) best = idx;
+  }
+  return best;
+}
+
+/**
+ * Prefer a slice that contains the first substring match so long lines still show highlights.
+ */
+function _truncateDisplayWithSearchHighlight(str, maxLen, terms) {
+  const s = String(str ?? '');
+  if (s.length <= maxLen) return s;
+  if (!terms?.length) return _truncateDisplay(s, maxLen);
+  const idx = _firstSubstringMatchIndex(s, terms);
+  if (idx < 0) return _truncateDisplay(s, maxLen);
+  const lead = Math.min(56, Math.floor(maxLen * 0.38));
+  const start = Math.max(0, Math.min(idx - lead, s.length - maxLen));
+  const slice = s.slice(start, start + maxLen);
+  const prefix = start > 0 ? '…' : '';
+  const suffix = start + maxLen < s.length ? '…' : '';
+  return prefix + slice + suffix;
+}
+
+/** Tokens skipped when deriving plain-text highlight words from the search box. */
+const _PLAIN_SEARCH_HIGHLIGHT_STOP = new Set([
+  'or', 'and', 'not', '||', '&&', '!', '=', '===', '!=', '<', '<=', '>', '>=',
+]);
+
+/**
+ * Words from the search box to highlight in hit lines when the query has no `@` or `#`.
+ * @returns {string[]|null}
+ */
+function _plainSearchHighlightTermsFromQuery(queryRaw) {
+  const q = String(queryRaw || '').trim();
+  if (!q || /[@#]/.test(q)) return null;
+  const tokens = q.split(/\s+/).filter(Boolean);
+  const seen = new Set();
+  const out = [];
+  for (const tok of tokens) {
+    const lower = tok.toLowerCase();
+    if (_PLAIN_SEARCH_HIGHLIGHT_STOP.has(lower)) continue;
+    if (tok.length < 2) continue;
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    out.push(tok);
+  }
+  return out.length ? out : null;
+}
+
+/**
+ * Case-insensitive substring highlights as safe HTML (`<mark class="rv-search-hit-mark">`).
+ * Partial word matches are included; same rules as `_searchHighlightSubstringRegex`.
+ * @param {string} text
+ * @param {string[]} terms
+ */
+function _highlightPlainSearchTermsInText(text, terms) {
+  if (!text || !terms?.length) return _esc(text);
+  const re = _searchHighlightSubstringRegex(terms);
+  const parts = [];
+  let last = 0;
+  let m;
+  const r = new RegExp(re.source, re.flags);
+  while ((m = r.exec(text)) !== null) {
+    if (m.index > last) parts.push(_esc(text.slice(last, m.index)));
+    parts.push(`<mark class="rv-search-hit-mark">${_esc(m[0])}</mark>`);
+    last = m.index + m[0].length;
+    if (m[0].length === 0) r.lastIndex++;
+  }
+  if (last < text.length) parts.push(_esc(text.slice(last)));
+  return parts.join('');
+}
+
+/** Active task-status chip values (`done`, `started`, …) from the sidebar. */
+function _activeTaskStatusSet(el) {
+  try {
+    return new Set(
+      [...el.querySelectorAll('.rv-status-bar .rv-chip--active')]
+        .map(c => c.dataset.status)
+        .filter(Boolean)
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Tabler icon class for leading checkbox on a **task** search hit line (done vs open).
+ * Non-task line hits return null — no checkbox affordance for plain text/heading/etc.
+ */
+function _lineItemHitCheckboxIcon(li, activeTaskStatuses) {
+  const st = activeTaskStatuses instanceof Set ? activeTaskStatuses : new Set();
+  if (!li || li.type !== 'task') return null;
+  try {
+    const p = li.props;
+    if (
+      p &&
+      (p.done === true ||
+        p.done === 1 ||
+        p.completed === true ||
+        String(p.taskStatus || '').toLowerCase() === 'done' ||
+        String(p.status || '').toLowerCase() === 'done')
+    ) {
+      return 'ti-square-check';
+    }
+  } catch { /* ignore */ }
+  // Done filter: hits are done tasks; line props often omit completion flags.
+  if (st.has('done')) {
+    return 'ti-square-check';
+  }
+  return 'ti-square';
+}
+
+/**
+ * Client-side filter for search/compare result rows (case-insensitive substring).
+ * Matches note title, collection name, or matching line text.
+ * @returns {{ filtered: { record: object, lineItem: object|null }[], totalBeforeFilter: number }}
+ */
+function _filterSearchRows(rows, filterText, recordColMap) {
+  const totalBeforeFilter = rows.length;
   const n = String(filterText || '').trim().toLowerCase();
-  if (!n) return { filtered: records, totalBeforeFilter };
-  const filtered = records.filter(r => {
+  if (!n) return { filtered: rows, totalBeforeFilter };
+  const filtered = rows.filter(row => {
+    const r = row.record;
     try {
       if (String(r.getName() || '').toLowerCase().includes(n)) return true;
     } catch { /* ignore */ }
     const m = recordColMap?.[r.guid];
     if (m && String(m.colName || '').toLowerCase().includes(n)) return true;
+    if (row.lineItem) {
+      const t = _lineItemPlainText(row.lineItem).toLowerCase();
+      if (t.includes(n)) return true;
+    }
     return false;
   });
   return { filtered, totalBeforeFilter };
 }
 
-/** TSV lines: Title, Collection, Record ID — for clipboard / spreadsheets. */
-function _formatRecordListForClipboard(records, recordColMap) {
-  const lines = ['Title\tCollection\tRecord ID'];
+/** TSV lines: Title, Collection, Record ID, Match line(s) — merged rows join hits with ` | `. */
+function _formatSearchRowsForClipboard(rows, recordColMap) {
+  const lines = ['Title\tCollection\tRecord ID\tMatch line'];
   const flat = s => String(s ?? '').replace(/\r|\n|\t/g, ' ');
-  for (const r of records) {
+  for (const row of rows) {
+    const r = row.record;
     if (!r) continue;
     let title = '(untitled)';
     try {
@@ -3203,7 +3543,11 @@ function _formatRecordListForClipboard(records, recordColMap) {
     } catch { /* ignore */ }
     const m = recordColMap?.[r.guid];
     const col = m ? flat(m.colName) : '';
-    lines.push([flat(title), col, String(r.guid)].join('\t'));
+    const matchLine = (row.lineItems || [])
+      .map(li => flat(_lineItemPlainText(li)))
+      .filter(Boolean)
+      .join(' | ');
+    lines.push([flat(title), col, String(r.guid), matchLine].join('\t'));
   }
   return lines.join('\n');
 }
@@ -3781,6 +4125,49 @@ const CSS = `
   margin-top: 1px;
 }
 .rv-card-main { flex: 1; min-width: 0; }
+.rv-card-hit-lines {
+  margin-top: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.rv-card-hit-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.45;
+  font-weight: 400;
+  color: inherit;
+  opacity: 0.78;
+}
+.rv-card-hit-check-wrap {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1px;
+}
+.rv-card-hit-check-wrap .ti {
+  font-size: 13px;
+  opacity: 0.72;
+  line-height: 1;
+}
+.rv-card-hit-line-text {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.rv-card-hit-line-text .rv-search-hit-mark {
+  background: #fff200;
+  color: #0d0d0d;
+  border-radius: 2px;
+  padding: 0 2px;
+  box-shadow: inset 0 0 0 1px rgba(234, 179, 0, 0.55);
+}
 /* One line: title (ellipsis) + [collection] + · relative time */
 .rv-card-one-line {
   display: flex;

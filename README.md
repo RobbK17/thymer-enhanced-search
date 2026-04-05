@@ -1,12 +1,15 @@
 # Enhanced Search — Thymer Plugin
 
-**Version 1.1.5**
-
-Cross-collection record viewer with **Search**, **Duplicates**, and **Compare** modes: filters for text, hashtags, tagged dates, task status, journal day/range, and collections; duplicate and similar title/body analysis (optional property fields in body); side-by-side compare with line diff and keyed property diff for two or three notes; and presets for search and duplicate settings.
+**Version 1.1.7**
+ Cross-collection record viewer with **Search**, **Duplicates**,modes: filters for text, hashtags, tagged dates, task status, journal day/range, and collections; duplicate and similar title/body analysis (optional property fields in body); side-by-side compare with line diff and keyed property diff for two or three notes; and presets for search and duplicate settings.
 
 ## Modes
 
-Use the **Search** / **Duplicates** / **Compare** buttons at the top of the sidebar. **Collections** at the bottom apply to all modes (which collections are included in searches, duplicate scans, and compare card lists).
+Use the **Search** / **Duplicates** buttons at the top of the sidebar.
+
+**Search vs Duplicates** — The sidebar is one shared panel, but **each mode keeps its own snapshot** of controls. When you leave **Search** or **Duplicates**, that mode’s filters (including search text, chips, journal, presets-in-effect, sort, filter results, duplicate kind/threshold/options, and **collection checkboxes**) are saved; when you **return**, they are restored. That way a search preset or duplicate preset in one mode does not stick in the other mode’s UI when you switch tabs. Entering **Compare** from Search or Duplicates also saves the current mode’s snapshot so returning stays consistent.
+
+**Collections** — The same checkbox list is used for searches, duplicate scans, and compare card lists; **which boxes are checked is restored per mode** when you switch between Search and Duplicates (last state you had when you left that mode).
 
 ### Search
 
@@ -15,7 +18,7 @@ In the sidebar (Search mode), sections run **Tagged date** → **Journal date** 
 - **Active summary** — In **Search** mode, directly under the mode bar, one line shows what is currently active (e.g. search text, which tagged-date chip, journal day/range, or task statuses). **Section headers** for Tagged date, Journal date, Task status, and Search show a small check when that filter is on.
 - **Combining filters** — **Search text** (the text box) can combine with **at most one** of **Tagged date**, **Journal date**, or **Task status**. Those three are **mutually exclusive**: turning on a chip or day in one clears the other two (e.g. you can use text + task status, or text + tagged date, but not tagged date + journal at once). Header **clear** links only clear that section.
 - **Search** — Plain text plus `#hashtags` (Thymer’s normal search rules). The search box and **include #types** sit after **Task status** and before **Presets**.
-- **Task status** — Chips such as All tasks, Done, Started, … (adds `@…` filters to the search). **clear** on the same line clears status chips only.
+- **Task status** — Chips such as Done, Started, Important, … (adds `@…` filters to the search). **clear** on the same line clears status chips only.
 - **Tagged date** — Today, Tomorrow, This week, Due, Overdue (adds `@today`, `@week`, etc.). **clear** clears tagged-date chips only.
 - **include #types** — Optional; when a selected collection has a **choice** field named `type` or `types`, merges extra matches on that field from your words and `#tags` (see below).
 - **Journal date** — Picks an anchor **calendar day** and loads journal pages for a **range** (see below). Separate from normal search when active. **clear** clears journal selection.
@@ -23,6 +26,8 @@ In the sidebar (Search mode), sections run **Tagged date** → **Journal date** 
 - **Collections** — Limit which collections are searched (or which journals are queried in journal mode).
 - **Sort** — **Modified (newest first)** (default), **Title (A–Z)**, or **Collection, then modified**; applies to normal search (mixed journal + other collections). Choice is remembered per workspace and stored in presets. **Journal date** mode does not show the sort control.
 - **Filter results** — After results load, optionally narrow the **card list** by substring on **note title** or **collection name**. This is a client-side filter only; it does **not** change the Thymer query. Counts can show how many rows match before this filter.
+- **Match lines on cards** — Under the title, each **line hit** shows a snippet of matching text. A small **checkbox icon** appears only when that hit is a **task** line (done vs open); plain text, headings, and other line types have **no** checkbox icon.
+- **Highlighting (plain search text)** — If the search box has **no `@` and no `#`** anywhere, words from the box (skipping boolean/operator tokens like `OR`, `AND`, …) are **highlighted** inside those snippets: **case-insensitive substring** matches (including **partial** words, e.g. `run` in `running`). Long snippets are **clipped** to fit, preferring a window that includes the **first** highlighted match. Highlights use a **bright yellow** background with dark text for contrast.
 - **Copy list** — In the results toolbar (**Copy list**), copies the **full current result list** (after **Filter results**, if any) to the clipboard as tab-separated **Title**, **Collection**, and **Record ID** — one row per note, header row included (pastes cleanly into spreadsheets). The same control appears on the Compare card list.
 - **Presets** — Save and reload combinations of search filters (search text, status, tagged date, journal date, range, collections, include #types, sort, **Filter results** text).
 - **Open a result** — Click a card to open the record in a panel.
@@ -40,9 +45,11 @@ In the sidebar (Search mode), sections run **Tagged date** → **Journal date** 
 
 ### Compare
 
-- Run a query in **Search** first so the main area has a result list (or use **Duplicates** results). The **Compare** tray and **Open compare** appear in the sidebar in **Search**, **Duplicates**, and **Compare** modes.
-- Use **+** on cards to add up to **three** notes to the tray; **Open compare** opens a **two-note** line diff or a **three-note** side-by-side view. Switch to **Compare** if you only want the compare card list in the main area.
+- Run a query in **Search** first so the main area has a result list (or use **Duplicates** results). 
+- Use **+** on cards to add up to **three** notes to the tray; **Open compare** opens a **two-note** line diff or a **three-note** side-by-side view. 
+
 - **Two notes** — Line-oriented diff (insert/delete style) with **Properties** shown as a keyed two-column grid (same property keys aligned); cells are tinted for equal lines, mismatches, or values only on one side. Empty sides use a softer “missing” style than value mismatches.
+
 - **Three notes** — **Body** uses a **three-way line alignment** (not just line index): insertions/deletions are aligned across columns where possible; the body area is one **CSS grid** so each logical row keeps the **same height** across all three columns (including wrapped lines and empty gap cells). **Properties** use a **three-column keyed** grid (one row per property key) with per-cell semantic highlighting; missing fields use the same softer style as two-pane.
 - **Filter list** — Shown in **Compare** mode only (hidden in Search/Duplicates). Narrows which notes appear in the compare card list (matches note title or collection name); does not change the underlying search result set from Thymer.
 - **Clear** empties the tray. From the diff / side-by-side view, **Back to list** (Compare mode), **Back to duplicates** (Duplicates), or **Back to search** (Search) returns to that list and **clears the compare tray** (selected notes).
@@ -53,7 +60,7 @@ In the sidebar (Search mode), sections run **Tagged date** → **Journal date** 
 **Tagged date**, **Journal date**, and **Task status** are **mutually exclusive** in the sidebar (turning on one clears the others). **Search text** can still combine with whichever of those three is active (for example text + task status, or text + tagged date). When **Journal date** is off, the plugin builds **one** Thymer query from the search box plus **either** task-status chips **or** a single tagged-date chip (not both). Everything is turned into **one query** for Thymer:
 
 1. The **entire search box** string is sent **as you typed it** (spaces, `OR` / `AND` / `NOT`, `===`, `!=`, `#tags`, etc. are **not** rewritten by the plugin).  
-2. Any **task status** chips you turned on (`@task`, `@done`, …), **or** at most one **Tagged date** chip (`@today`, `@tomorrow`, `@week`, `@due`, `@overdue`) — not both; the UI keeps status and tagged date mutually exclusive when you are not in journal mode.
+2. Any **task status** chips you turned on (`@done`, `@started`, …), **or** at most one **Tagged date** chip (`@today`, `@tomorrow`, `@week`, `@due`, `@overdue`) — not both; the UI keeps status and tagged date mutually exclusive when you are not in journal mode. You can still type **`@task`** in the search box to scope to tasks.
 
 Those pieces are combined and run together, so—for example—`report #client` with **Today** and **Done** asks Thymer for results that match **all** of those constraints (as its search language defines).
 
