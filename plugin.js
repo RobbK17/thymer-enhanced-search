@@ -1,10 +1,10 @@
 /**
- * Enhanced Search — Thymer plugin v1.1.7
+ * Enhanced Search — Thymer plugin v1.1.8
  * Cross-collection record viewer with filters (see README).
  * Modes: Search, Duplicates (analysis), Compare (2–3 notes + diff).
  */
 const PLUGIN_NAME = 'Enhanced Search';
-const PLUGIN_VERSION = '1.1.7';
+const PLUGIN_VERSION = '1.1.8';
 
 /** Skip duplicate/similar scans above this many records (per selected collections). */
 const DUPLICATE_SCAN_MAX_RECORDS = 2500;
@@ -223,6 +223,7 @@ class Plugin extends AppPlugin {
     this._syncSearchClear(el);
     this._syncDupKindUI(el);
     this._bindCardActions(el, panel);
+    this._bindMocDialog(el, panel);
     this._renderPresets(el);
     this._renderDupPresets(el);
     this._updateTypeSearchCheckboxVisibility(el);
@@ -375,7 +376,8 @@ class Plugin extends AppPlugin {
     return _filterSearchRows(this._matchRows || [], raw, this._recordColMap);
   }
 
-  async _copyResultListToClipboard(el) {
+  /** @returns {{ record: object, lineItems: object[] }[]|null} */
+  _getMergedClipboardRows(el) {
     let flatRows;
     if (this._panelMode === 'compare') {
       const filterRaw = el.querySelector('.rv-compare-filter')?.value ?? '';
@@ -387,11 +389,13 @@ class Plugin extends AppPlugin {
     } else if (this._panelMode === 'search') {
       flatRows = this._getSearchFilteredRecords(el).filtered;
     } else {
-      return;
+      return null;
     }
-    if (!flatRows.length) return;
-    const merged = _mergeSearchRowsByRecord(flatRows);
-    const text = _formatSearchRowsForClipboard(merged, this._recordColMap);
+    if (!flatRows.length) return null;
+    return _mergeSearchRowsByRecord(flatRows);
+  }
+
+  async _writeTextToClipboard(text) {
     try {
       await navigator.clipboard.writeText(text);
     } catch {
@@ -407,6 +411,328 @@ class Plugin extends AppPlugin {
         document.body.removeChild(ta);
       } catch { /* ignore */ }
     }
+  }
+
+  async _copyResultListToClipboard(el) {
+    const merged = this._getMergedClipboardRows(el);
+    if (!merged) return;
+    const text = _formatSearchRowsForClipboard(merged, this._recordColMap);
+    await this._writeTextToClipboard(text);
+  }
+
+  _buildMocMarkdown(el) {
+    const merged = this._getMergedClipboardRows(el);
+    if (!merged?.length) return null;
+    return _formatSearchRowsForMoc(merged, this._recordColMap);
+  }
+
+  async _copyMocListToClipboard(el) {
+    const text = this._buildMocMarkdown(el);
+    if (!text) return;
+    await this._writeTextToClipboard(text);
+  }
+
+  _closeMocDialog(el) {
+    const ov = el.querySelector('.rv-moc-overlay');
+    if (ov) ov.hidden = true;
+  }
+
+  async _openMocDialog(el) {
+    if (!this._buildMocMarkdown(el)) {
+      try {
+        alert('No results to export. Run a search or compare query first.');
+      } catch { /* ignore */ }
+      return;
+    }
+    const nr = el.querySelector('input[name="rv-moc-mode"][value="new"]');
+    if (nr) nr.checked = true;
+    const tn = el.querySelector('.rv-moc-title-new');
+    if (tn) tn.value = 'Map of content';
+    const am = el.querySelector('.rv-moc-append-mode');
+    if (am) am.value = 'append';
+    this._fillMocDialogCollections(el);
+    this._syncMocModeUI(el);
+    const ov = el.querySelector('.rv-moc-overlay');
+    if (ov) ov.hidden = false;
+  }
+
+  _fillMocDialogCollections(el) {
+    const selNew = el.querySelector('.rv-moc-col-new');
+    const selEx = el.querySelector('.rv-moc-col-existing');
+    if (!selNew || !selEx) return;
+    const opts = () => {
+      const parts = ['<option value="">— Select collection —</option>'];
+      for (const col of this._collections || []) {
+        const g = _esc(col.getGuid());
+        const n = _esc(col.getName() || '');
+        const j = typeof col.isJournalPlugin === 'function' && col.isJournalPlugin();
+        parts.push(`<option value="${g}"${j ? ' data-journal="1"' : ''}>${n}${j ? ' (journal)' : ''}</option>`);
+      }
+      return parts.join('');
+    };
+    selNew.innerHTML = opts();
+    selEx.innerHTML = opts();
+    if (this._collections?.length) {
+      const firstNonJournal = this._collections.find(
+        c => !(typeof c.isJournalPlugin === 'function' && c.isJournalPlugin())
+      );
+      if (firstNonJournal) selNew.value = firstNonJournal.getGuid();
+      selEx.value = this._collections[0].getGuid();
+    }
+  }
+
+  _syncMocModeUI(el) {
+    const mode = el.querySelector('input[name="rv-moc-mode"]:checked')?.value || 'new';
+    const newSec = el.querySelector('.rv-moc-new-section');
+    const exSec = el.querySelector('.rv-moc-existing-section');
+    const appendRow = el.querySelector('.rv-moc-append-row');
+    if (newSec) newSec.hidden = mode !== 'new';
+    if (exSec) exSec.hidden = mode !== 'existing';
+    if (appendRow) appendRow.hidden = mode !== 'existing';
+    if (mode === 'existing') void this._mocRefreshRecordSelect(el);
+  }
+
+  async _mocRefreshRecordSelect(el) {
+    const colGuid = el.querySelector('.rv-moc-col-existing')?.value;
+    const sel = el.querySelector('.rv-moc-record-select');
+    if (!sel) return;
+    sel.innerHTML = '<option value="">— Select note —</option>';
+    if (!colGuid) return;
+    const col = this._collections.find(c => c.getGuid() === colGuid);
+    if (!col) return;
+    let records = [];
+    try {
+      records = await col.getAllRecords();
+    } catch {
+      return;
+    }
+    const sorted = [...records].sort((a, b) => {
+      const na = String(a.getName() || '').toLowerCase();
+      const nb = String(b.getName() || '').toLowerCase();
+      return na.localeCompare(nb, undefined, { sensitivity: 'base' });
+    });
+    for (const r of sorted) {
+      const opt = document.createElement('option');
+      opt.value = r.guid;
+      opt.textContent = r.getName() || '(untitled)';
+      sel.appendChild(opt);
+    }
+  }
+
+  async _recordHasBodyContent(record) {
+    try {
+      const items = await record.getLineItems(false);
+      const arr = Array.isArray(items) ? items : items ? [items] : [];
+      for (const li of arr) {
+        const segs = li.segments || [];
+        for (const s of segs) {
+          const t = String(s.text ?? '').trim();
+          if (s.type === 'text' && t) return true;
+          if (s.type === 'ref') return true;
+          if (s.type === 'hashtag' && t) return true;
+          if (s.type === 'link' && t) return true;
+          if (s.type === 'linkobj' && t) return true;
+        }
+      }
+    } catch { /* ignore */ }
+    return false;
+  }
+
+  async _clearRecordBody(record) {
+    for (let i = 0; i < 500; i++) {
+      const items = await record.getLineItems(false);
+      const arr = Array.isArray(items) ? items : items ? [items] : [];
+      if (!arr.length) return;
+      await arr[0].delete();
+    }
+  }
+
+  /**
+   * Insert MOC as real line items with `ref` segments so links resolve in the editor.
+   * `insertFromMarkdown` does not turn `[[…]]` into record refs — only Copy still emits that text.
+   * @param {PluginRecord} record
+   * @param {{ record: object, lineItems?: object[] }[]} mergedRows
+   * @param {Record<string, { colName?: string }>|null} recordColMap
+   * @param {PluginLineItem|null} afterTopItem - insert after this top-level sibling, or null for start
+   */
+  async _mocInsertStructuredContent(record, mergedRows, recordColMap, afterTopItem) {
+    const groups = _groupSearchRowsForMoc(mergedRows, recordColMap);
+    if (!groups.length) return;
+    let afterItem = afterTopItem;
+    const h1 = await record.createLineItem(null, afterItem, 'heading', [{ type: 'text', text: 'Map of content' }], null);
+    await h1.setHeadingSize(1);
+    afterItem = h1;
+    for (const { col, items } of groups) {
+      const headingText = col.replace(/\r|\n/g, ' ').trim() || '(no collection)';
+      const h2 = await record.createLineItem(null, afterItem, 'heading', [{ type: 'text', text: headingText }], null);
+      await h2.setHeadingSize(2);
+      afterItem = h2;
+      if (!items.length) continue;
+      const ulist = await record.createLineItem(null, afterItem, 'ulist', null, null);
+      afterItem = ulist;
+      let prevInList = null;
+      for (const { title, guid } of items) {
+        const li = await record.createLineItem(
+          ulist,
+          prevInList,
+          'text',
+          [{ type: 'ref', text: _mocRefPayload(title, guid) }],
+          null
+        );
+        prevInList = li;
+      }
+    }
+  }
+
+  async _mocAppendMocStructured(record, mergedRows) {
+    const items = await record.getLineItems(false);
+    const arr = Array.isArray(items) ? items : items ? [items] : [];
+    const last = arr.length ? arr[arr.length - 1] : null;
+    await this._mocInsertStructuredContent(record, mergedRows, this._recordColMap, last);
+  }
+
+  /**
+   * After `collection.createRecord`, `data.getRecord(guid)` may be null briefly until the
+   * workspace indexes the new record — poll so MOC write + open works reliably.
+   */
+  async _waitForDataRecord(guid, opts = {}) {
+    const timeoutMs = opts.timeoutMs ?? 8000;
+    const stepMs = opts.stepMs ?? 32;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const r = this.data.getRecord(guid);
+      if (r) return r;
+      await new Promise(res => setTimeout(res, stepMs));
+    }
+    return this.data.getRecord(guid);
+  }
+
+  async _mocOpenWrittenNote(panel, guid) {
+    const newPanel = await this.ui.createPanel({ afterPanel: panel });
+    if (newPanel) {
+      newPanel.navigateTo({
+        type: 'edit_panel',
+        rootId: guid,
+        subId: null,
+        workspaceGuid: this.getWorkspaceGuid(),
+      });
+    }
+  }
+
+  async _mocWriteToNote(el, panel) {
+    const merged = this._getMergedClipboardRows(el);
+    if (!merged?.length) {
+      try {
+        alert('No results to export.');
+      } catch { /* ignore */ }
+      return;
+    }
+    const mode = el.querySelector('input[name="rv-moc-mode"]:checked')?.value || 'new';
+    if (mode === 'new') {
+      const colGuid = el.querySelector('.rv-moc-col-new')?.value;
+      const title = el.querySelector('.rv-moc-title-new')?.value?.trim() || 'Map of content';
+      const col = this._collections.find(c => c.getGuid() === colGuid);
+      if (!colGuid || !col) {
+        try {
+          alert('Select a collection.');
+        } catch { /* ignore */ }
+        return;
+      }
+      if (typeof col.isJournalPlugin === 'function' && col.isJournalPlugin()) {
+        try {
+          alert('Choose a non-journal collection for a new note, or use “Existing note” for a journal page.');
+        } catch { /* ignore */ }
+        return;
+      }
+      const guid = col.createRecord(title);
+      if (!guid) {
+        try {
+          alert('Could not create note in that collection.');
+        } catch { /* ignore */ }
+        return;
+      }
+      const record = await this._waitForDataRecord(guid);
+      if (!record) {
+        try {
+          alert('Created note could not be opened.');
+        } catch { /* ignore */ }
+        return;
+      }
+      try {
+        await this._mocInsertStructuredContent(record, merged, this._recordColMap, null);
+      } catch (e) {
+        try {
+          alert('Could not write content: ' + (e?.message || String(e)));
+        } catch { /* ignore */ }
+        return;
+      }
+      this._closeMocDialog(el);
+      await this._mocOpenWrittenNote(panel, guid);
+      return;
+    }
+    const recGuid = el.querySelector('.rv-moc-record-select')?.value;
+    if (!recGuid) {
+      try {
+        alert('Select a note.');
+      } catch { /* ignore */ }
+      return;
+    }
+    const record = this.data.getRecord(recGuid);
+    if (!record) {
+      try {
+        alert('Note not found.');
+      } catch { /* ignore */ }
+      return;
+    }
+    const wantAppend = el.querySelector('.rv-moc-append-mode')?.value === 'append';
+    let hasBody = false;
+    try {
+      hasBody = await this._recordHasBodyContent(record);
+    } catch { /* ignore */ }
+    try {
+      if (wantAppend && hasBody) {
+        await this._mocAppendMocStructured(record, merged);
+      } else if (!wantAppend && hasBody) {
+        let ok = true;
+        try {
+          ok = confirm(
+            'Replace all content in this note? This cannot be undone from here.'
+          );
+        } catch {
+          ok = false;
+        }
+        if (!ok) return;
+        await this._clearRecordBody(record);
+        await this._mocInsertStructuredContent(record, merged, this._recordColMap, null);
+      } else {
+        await this._mocInsertStructuredContent(record, merged, this._recordColMap, null);
+      }
+    } catch (e) {
+      try {
+        alert('Could not write: ' + (e?.message || String(e)));
+      } catch { /* ignore */ }
+      return;
+    }
+    this._closeMocDialog(el);
+    await this._mocOpenWrittenNote(panel, recGuid);
+  }
+
+  _bindMocDialog(el, panel) {
+    const ov = el.querySelector('.rv-moc-overlay');
+    if (!ov) return;
+    ov.addEventListener('click', e => {
+      if (e.target === ov) this._closeMocDialog(el);
+    });
+    el.querySelector('.rv-moc-cancel')?.addEventListener('click', () => this._closeMocDialog(el));
+    el.querySelector('.rv-moc-copy-only')?.addEventListener('click', async () => {
+      await this._copyMocListToClipboard(el);
+      this._closeMocDialog(el);
+    });
+    el.querySelector('.rv-moc-write')?.addEventListener('click', () => void this._mocWriteToNote(el, panel));
+    el.querySelectorAll('input[name="rv-moc-mode"]').forEach(inp => {
+      inp.addEventListener('change', () => this._syncMocModeUI(el));
+    });
+    el.querySelector('.rv-moc-col-existing')?.addEventListener('change', () => void this._mocRefreshRecordSelect(el));
   }
 
   async _renderSearchPageFromMatchRecords(el) {
@@ -654,8 +980,12 @@ class Plugin extends AppPlugin {
 
   _applyFilterState(el, state) {
     el.querySelector('.rv-search-input').value = state.search || '';
+    const valid = new Set(TASK_STATUSES.map(s => s.value));
+    const statuses = (state.statuses || [])
+      .map(s => (s === 'started' ? 'inprogress' : s))
+      .filter(s => valid.has(s));
     el.querySelectorAll('.rv-status-bar .rv-chip').forEach(c => {
-      c.classList.toggle('rv-chip--active', (state.statuses || []).includes(c.dataset.status));
+      c.classList.toggle('rv-chip--active', statuses.includes(c.dataset.status));
     });
     el.querySelectorAll('.rv-date-bar .rv-chip').forEach(c => {
       c.classList.toggle('rv-chip--active', c.dataset.date === state.date);
@@ -1521,15 +1851,17 @@ class Plugin extends AppPlugin {
     const { texts: textsForType, tags: tagsForType } = _tokensForTypeMerge(raw);
 
     const activeStatuses = [...el.querySelectorAll('.rv-status-bar .rv-chip--active')]
-      .map(c => c.dataset.status);
-    activeStatuses.forEach(s => parts.push('@' + s));
+      .map(c => c.dataset.status)
+      .filter(Boolean);
+    const statusQuery = _taskStatusTokensOrJoined(activeStatuses);
+    if (statusQuery) parts.push(statusQuery);
 
     const activeDateChip = el.querySelector('.rv-date-bar .rv-chip--active');
     if (activeDateChip) parts.push(activeDateChip.dataset.date);
 
     // Status + tagged date only (for intersecting “include #types” merges with the same filters)
     const filterPartsOnly = [];
-    activeStatuses.forEach(s => filterPartsOnly.push('@' + s));
+    if (statusQuery) filterPartsOnly.push(statusQuery);
     if (activeDateChip) filterPartsOnly.push(activeDateChip.dataset.date);
     const filterQueryStructured = filterPartsOnly.join(' ').trim();
 
@@ -1899,9 +2231,14 @@ class Plugin extends AppPlugin {
         });
         return;
       }
-      if (e.target.closest('.rv-copy-result-list')) {
+      if (e.target.closest('.rv-copy-csv')) {
         e.stopPropagation();
         await this._copyResultListToClipboard(el);
+        return;
+      }
+      if (e.target.closest('.rv-copy-moc')) {
+        e.stopPropagation();
+        await this._openMocDialog(el);
         return;
       }
       if (e.target.closest('.rv-dup-dismiss')) {
@@ -1953,14 +2290,26 @@ class Plugin extends AppPlugin {
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const TASK_STATUSES = [
-  { value: 'done',      label: 'Done',       color: '#22c55e' },
-  { value: 'started',   label: 'Started',    color: '#3b82f6' },
-  { value: 'important', label: 'Important',  color: '#f97316' },
+  { value: 'done',       label: 'Done',        color: '#22c55e' },
+  { value: 'inprogress', label: 'In progress', color: '#3b82f6' },
+  { value: 'important',  label: 'Important',   color: '#f97316' },
   { value: 'waiting',   label: 'Waiting',    color: '#a855f7' },
   { value: 'discuss',   label: 'Discuss',    color: '#06b6d4' },
   { value: 'alert',     label: 'Alert',      color: '#ef4444' },
   { value: 'starred',   label: 'Starred',    color: '#eab308' },
 ];
+
+/**
+ * Sidebar task-status values → one Thymer query fragment: one `@token`, or `@a OR @b OR …` when several chips are on.
+ * @param {string[]} statusValues - e.g. `['done', 'inprogress']`
+ * @returns {string}
+ */
+function _taskStatusTokensOrJoined(statusValues) {
+  const vals = (statusValues || []).filter(Boolean);
+  if (!vals.length) return '';
+  if (vals.length === 1) return '@' + vals[0];
+  return vals.map(s => '@' + s).join(' OR ');
+}
 
 const DATE_FILTERS = [
   { value: '@today',        label: 'Today'     },
@@ -2219,7 +2568,9 @@ function _resultsToolbarHtml(pageStart, batchLen, total, pageSize, isJournal, so
       <span>·</span>
       <button type="button" class="rv-link rv-collapse-all">collapse all</button>
       <span>·</span>
-      <button type="button" class="rv-link rv-copy-result-list" title="Copy list of titles, collections, and record IDs (tab-separated)">Copy list</button>
+      <button type="button" class="rv-link rv-copy-csv" title="Copy results as CSV (Title, Collection, Record ID, Match line)">CSV</button>
+      <span>·</span>
+      <button type="button" class="rv-link rv-copy-moc" title="Map of content: write to a note or copy Markdown">MOC</button>
     </span>
   </div>
   ${sortRow}
@@ -3465,7 +3816,7 @@ function _highlightPlainSearchTermsInText(text, terms) {
   return parts.join('');
 }
 
-/** Active task-status chip values (`done`, `started`, …) from the sidebar. */
+/** Active task-status chip values (`done`, `inprogress`, …) from the sidebar. */
 function _activeTaskStatusSet(el) {
   try {
     return new Set(
@@ -3530,10 +3881,23 @@ function _filterSearchRows(rows, filterText, recordColMap) {
   return { filtered, totalBeforeFilter };
 }
 
-/** TSV lines: Title, Collection, Record ID, Match line(s) — merged rows join hits with ` | `. */
+/** Normalize cell text: newlines/tabs → space (before CSV escaping). */
+function _csvFlattenCell(s) {
+  return String(s ?? '').replace(/\r|\n|\t/g, ' ');
+}
+
+/** RFC-style CSV: comma-separated; fields with `,` or `"` quoted, `"` doubled inside quotes. */
+function _csvEscapeCell(s) {
+  const t = _csvFlattenCell(s);
+  if (/[",]/.test(t)) {
+    return `"${t.replace(/"/g, '""')}"`;
+  }
+  return t;
+}
+
+/** CSV lines: Title, Collection, Record ID, Match line(s) — merged rows join hits with ` | `. */
 function _formatSearchRowsForClipboard(rows, recordColMap) {
-  const lines = ['Title\tCollection\tRecord ID\tMatch line'];
-  const flat = s => String(s ?? '').replace(/\r|\n|\t/g, ' ');
+  const lines = ['Title,Collection,Record ID,Match line'];
   for (const row of rows) {
     const r = row.record;
     if (!r) continue;
@@ -3542,14 +3906,80 @@ function _formatSearchRowsForClipboard(rows, recordColMap) {
       title = String(r.getName() || '').trim() || '(untitled)';
     } catch { /* ignore */ }
     const m = recordColMap?.[r.guid];
-    const col = m ? flat(m.colName) : '';
+    const col = m ? String(m.colName ?? '') : '';
     const matchLine = (row.lineItems || [])
-      .map(li => flat(_lineItemPlainText(li)))
+      .map(li => _csvFlattenCell(_lineItemPlainText(li)))
       .filter(Boolean)
       .join(' | ');
-    lines.push([flat(title), col, String(r.guid), matchLine].join('\t'));
+    lines.push(
+      [_csvEscapeCell(title), _csvEscapeCell(col), _csvEscapeCell(String(r.guid)), _csvEscapeCell(matchLine)].join(',')
+    );
   }
   return lines.join('\n');
+}
+
+/**
+ * Wiki-style text for **Copy** / clipboard. `@Foo` is not a note link (reserved for filters).
+ * Pasting `[[Note title]]` into Thymer may resolve like the Obsidian importer; **`insertFromMarkdown`
+ * does not** create record links — use structured insert (`ref` segments) when writing from MOC.
+ * Titles containing `[` or `]` break the delimiter; we fall back to `[[guid]]`.
+ */
+function _mocWikiLink(recordTitle, guid) {
+  const t = String(recordTitle ?? '').replace(/\r|\n|\t/g, ' ').trim() || '(untitled)';
+  const g = String(guid || '').trim();
+  if (/[\[\]]/.test(t)) {
+    return g ? `[[${g}]]` : `[[${t}]]`;
+  }
+  return `[[${t}]]`;
+}
+
+/** Payload for a `ref` line-item segment (links to a record by guid). */
+function _mocRefPayload(recordTitle, guid) {
+  const t = String(recordTitle ?? '').replace(/\r|\n|\t/g, ' ').trim() || '(untitled)';
+  const g = String(guid || '').trim();
+  if (/[\[\]]/.test(t)) {
+    return g ? { guid: g, title: g } : { guid: g, title: '(untitled)' };
+  }
+  return { guid: g, title: t };
+}
+
+/**
+ * @returns {{ col: string, items: { title: string, guid: string }[] }[]}
+ */
+function _groupSearchRowsForMoc(rows, recordColMap) {
+  const byCol = new Map();
+  for (const row of rows) {
+    const r = row.record;
+    if (!r) continue;
+    let title = '(untitled)';
+    try {
+      title = String(r.getName() || '').trim() || '(untitled)';
+    } catch { /* ignore */ }
+    const m = recordColMap?.[r.guid];
+    const col = m ? String(m.colName ?? '').trim() || '(no collection)' : '(no collection)';
+    if (!byCol.has(col)) byCol.set(col, []);
+    byCol.get(col).push({ title, guid: r.guid });
+  }
+  return [...byCol.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0], undefined, { sensitivity: 'base' }))
+    .map(([col, items]) => ({ col, items }));
+}
+
+/**
+ * Markdown “map of content”: `# Map of content`, then `## collection` headings with `- [[title]]` bullets.
+ */
+function _formatSearchRowsForMoc(rows, recordColMap) {
+  const groups = _groupSearchRowsForMoc(rows, recordColMap);
+  const lines = ['# Map of content', ''];
+  for (const { col, items } of groups) {
+    const heading = col.replace(/\r|\n/g, ' ').trim() || '(no collection)';
+    lines.push(`## ${heading}`);
+    for (const { title, guid } of items) {
+      lines.push(`- ${_mocWikiLink(title, guid)}`);
+    }
+    lines.push('');
+  }
+  return `${lines.join('\n').trimEnd()}\n`;
 }
 
 // ─── Static HTML ─────────────────────────────────────────────────────────────
@@ -3730,6 +4160,41 @@ const SHELL_HTML = `
     </div>
   </div>
 
+  <div class="rv-moc-overlay" hidden>
+    <div class="rv-moc-dialog" role="dialog" aria-modal="true" aria-labelledby="rv-moc-dlg-title">
+      <div class="rv-moc-dlg-heading" id="rv-moc-dlg-title">Map of content</div>
+      <div class="rv-moc-mode">
+        <label class="rv-moc-radio"><input type="radio" name="rv-moc-mode" value="new" checked> New note</label>
+        <label class="rv-moc-radio"><input type="radio" name="rv-moc-mode" value="existing"> Existing note</label>
+      </div>
+      <div class="rv-moc-new-section">
+        <label class="rv-moc-label">Collection</label>
+        <select class="rv-moc-col-new"></select>
+        <label class="rv-moc-label">Note title</label>
+        <input type="text" class="rv-moc-title-new" value="Map of content" placeholder="Title for the new note" autocomplete="off">
+      </div>
+      <div class="rv-moc-existing-section" hidden>
+        <label class="rv-moc-label">Collection</label>
+        <select class="rv-moc-col-existing"></select>
+        <label class="rv-moc-label">Note</label>
+        <select class="rv-moc-record-select"><option value="">— Select note —</option></select>
+      </div>
+      <div class="rv-moc-append-row" hidden>
+        <label class="rv-moc-label">If the note already has content</label>
+        <select class="rv-moc-append-mode">
+          <option value="append">Append to end</option>
+          <option value="replace">Replace entire note</option>
+        </select>
+      </div>
+      <p class="rv-moc-hint">Writing to a note inserts <strong>clickable links</strong> to each result. Copy only uses <code>[[…]]</code> Markdown text.</p>
+      <div class="rv-moc-actions">
+        <button type="button" class="rv-link rv-moc-cancel">Cancel</button>
+        <button type="button" class="rv-link rv-moc-copy-only">Copy only</button>
+        <button type="button" class="rv-moc-write">Write</button>
+      </div>
+    </div>
+  </div>
+
 </div>`;
 
 // ─── Styles ───────────────────────────────────────────────────────────────────
@@ -3744,6 +4209,122 @@ const CSS = `
   font-size: 13px;
   color: var(--text-color-primary, var(--color-text, #e8e8e8));
   font-family: inherit;
+}
+
+.rv-moc-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  box-sizing: border-box;
+}
+.rv-moc-overlay[hidden] {
+  display: none !important;
+}
+.rv-moc-dialog {
+  width: min(420px, 100%);
+  max-height: min(90vh, 560px);
+  overflow-y: auto;
+  padding: 20px 18px;
+  border-radius: 10px;
+  border: 1px solid rgba(128, 128, 128, 0.28);
+  background: rgba(26, 26, 30, 0.98);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+.rv-moc-dlg-heading {
+  font-size: 15px;
+  font-weight: 700;
+  margin: 0 0 14px 0;
+}
+.rv-moc-mode {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+.rv-moc-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.rv-moc-new-section,
+.rv-moc-existing-section,
+.rv-moc-append-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+/* Author display:flex rule wins over the HTML hidden attribute unless we force this. */
+.rv-moc-new-section[hidden],
+.rv-moc-existing-section[hidden],
+.rv-moc-append-row[hidden] {
+  display: none !important;
+}
+.rv-moc-label {
+  font-size: 10px;
+  font-weight: 600;
+  opacity: 0.55;
+  text-transform: uppercase;
+  letter-spacing: 0.35px;
+}
+.rv-moc-col-new,
+.rv-moc-col-existing,
+.rv-moc-record-select,
+.rv-moc-append-mode,
+.rv-moc-title-new {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(128, 128, 128, 0.22);
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  outline: none;
+}
+.rv-moc-col-new:focus,
+.rv-moc-col-existing:focus,
+.rv-moc-record-select:focus,
+.rv-moc-append-mode:focus,
+.rv-moc-title-new:focus {
+  border-color: var(--color-accent, #2563eb);
+}
+.rv-moc-hint {
+  font-size: 10px;
+  opacity: 0.55;
+  line-height: 1.45;
+  margin: 0 0 14px 0;
+}
+.rv-moc-hint code {
+  font-size: 10px;
+  opacity: 0.9;
+}
+.rv-moc-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  justify-content: flex-end;
+}
+.rv-moc-write {
+  padding: 8px 14px;
+  border-radius: 6px;
+  border: none;
+  background: var(--color-accent, #2563eb);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.rv-moc-write:hover {
+  filter: brightness(1.08);
 }
 
 /* ── Sidebar ── */

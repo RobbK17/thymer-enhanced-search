@@ -1,7 +1,13 @@
 # Enhanced Search — Thymer Plugin
 
-**Version 1.1.7**
- Cross-collection record viewer with **Search**, **Duplicates**,modes: filters for text, hashtags, tagged dates, task status, journal day/range, and collections; duplicate and similar title/body analysis (optional property fields in body); side-by-side compare with line diff and keyed property diff for two or three notes; and presets for search and duplicate settings.
+**Version 1.1.8**
+
+Cross-collection record viewer with **Search**, **Duplicates**, and **Compare** modes: filters for text, hashtags, tagged dates, task status, journal day/range, and collections; duplicate and similar title/body analysis (optional property fields in body); side-by-side compare with line diff and keyed property diff for two or three notes; and presets for search and duplicate settings.
+
+### 1.1.8
+
+- **Task status:** **In progress** uses **`@inprogress`** in the Thymer query (the old **Started** / `@started` chip is removed). With **several** task-status chips selected, the plugin joins their tokens with **`OR`** (e.g. `@done OR @inprogress`). Saved presets that still reference `started` load as **In progress**.
+- **MOC (Map of content):** **Write to a note** inserts **clickable** links to each result (native record references in the editor). **Copy only** still copies Markdown with `- [[…]]`-style bullets for use elsewhere. **New note** waits until the created record is available before writing; **New note** / **Existing note** blocks in the dialog show and hide correctly.
 
 ## Modes
 
@@ -18,7 +24,7 @@ In the sidebar (Search mode), sections run **Tagged date** → **Journal date** 
 - **Active summary** — In **Search** mode, directly under the mode bar, one line shows what is currently active (e.g. search text, which tagged-date chip, journal day/range, or task statuses). **Section headers** for Tagged date, Journal date, Task status, and Search show a small check when that filter is on.
 - **Combining filters** — **Search text** (the text box) can combine with **at most one** of **Tagged date**, **Journal date**, or **Task status**. Those three are **mutually exclusive**: turning on a chip or day in one clears the other two (e.g. you can use text + task status, or text + tagged date, but not tagged date + journal at once). Header **clear** links only clear that section.
 - **Search** — Plain text plus `#hashtags` (Thymer’s normal search rules). The search box and **include #types** sit after **Task status** and before **Presets**.
-- **Task status** — Chips such as Done, Started, Important, … (adds `@…` filters to the search). **clear** on the same line clears status chips only.
+- **Task status** — Chips such as Done, In progress, Important, … (adds `@…` filters to the search). **clear** on the same line clears status chips only.
 - **Tagged date** — Today, Tomorrow, This week, Due, Overdue (adds `@today`, `@week`, etc.). **clear** clears tagged-date chips only.
 - **include #types** — Optional; when a selected collection has a **choice** field named `type` or `types`, merges extra matches on that field from your words and `#tags` (see below).
 - **Journal date** — Picks an anchor **calendar day** and loads journal pages for a **range** (see below). Separate from normal search when active. **clear** clears journal selection.
@@ -28,7 +34,8 @@ In the sidebar (Search mode), sections run **Tagged date** → **Journal date** 
 - **Filter results** — After results load, optionally narrow the **card list** by substring on **note title** or **collection name**. This is a client-side filter only; it does **not** change the Thymer query. Counts can show how many rows match before this filter.
 - **Match lines on cards** — Under the title, each **line hit** shows a snippet of matching text. A small **checkbox icon** appears only when that hit is a **task** line (done vs open); plain text, headings, and other line types have **no** checkbox icon.
 - **Highlighting (plain search text)** — If the search box has **no `@` and no `#`** anywhere, words from the box (skipping boolean/operator tokens like `OR`, `AND`, …) are **highlighted** inside those snippets: **case-insensitive substring** matches (including **partial** words, e.g. `run` in `running`). Long snippets are **clipped** to fit, preferring a window that includes the **first** highlighted match. Highlights use a **bright yellow** background with dark text for contrast.
-- **Copy list** — In the results toolbar (**Copy list**), copies the **full current result list** (after **Filter results**, if any) to the clipboard as tab-separated **Title**, **Collection**, and **Record ID** — one row per note, header row included (pastes cleanly into spreadsheets). The same control appears on the Compare card list.
+- **CSV** — In the results toolbar (**CSV**), copies the **full current result list** (after **Filter results**, if any) to the clipboard as **CSV** (comma-separated): **Title**, **Collection**, **Record ID**, and **Match line** — one row per note, header row included; fields that contain commas or quotes are quoted per usual CSV rules (pastes cleanly into spreadsheets). The same control appears on the Compare card list.
+- **MOC** — Next to CSV (**MOC**), opens a dialog: **Write** builds the same **grouped list** (by collection) into a **new note** (pick collection + title; journal collections are not used for new notes) or an **existing note** (pick collection, then note), using **clickable record links** in the editor—not plain `[[…]]` Markdown paste. For existing notes with content, choose **Append to end** or **Replace entire note** (replace asks for confirmation). **Copy only** copies **Markdown** (`- [[…]]` bullets) to the clipboard without writing. After a successful write, the plugin opens that note in a new editor panel.
 - **Presets** — Save and reload combinations of search filters (search text, status, tagged date, journal date, range, collections, include #types, sort, **Filter results** text).
 - **Open a result** — Click a card to open the record in a panel.
 
@@ -60,7 +67,7 @@ In the sidebar (Search mode), sections run **Tagged date** → **Journal date** 
 **Tagged date**, **Journal date**, and **Task status** are **mutually exclusive** in the sidebar (turning on one clears the others). **Search text** can still combine with whichever of those three is active (for example text + task status, or text + tagged date). When **Journal date** is off, the plugin builds **one** Thymer query from the search box plus **either** task-status chips **or** a single tagged-date chip (not both). Everything is turned into **one query** for Thymer:
 
 1. The **entire search box** string is sent **as you typed it** (spaces, `OR` / `AND` / `NOT`, `===`, `!=`, `#tags`, etc. are **not** rewritten by the plugin).  
-2. Any **task status** chips you turned on (`@done`, `@started`, …), **or** at most one **Tagged date** chip (`@today`, `@tomorrow`, `@week`, `@due`, `@overdue`) — not both; the UI keeps status and tagged date mutually exclusive when you are not in journal mode. You can still type **`@task`** in the search box to scope to tasks.
+2. Any **task status** chips you turned on are sent as `@token` strings; **several chips** are combined with **`OR`** (e.g. `@done OR @inprogress`). **Or** at most one **Tagged date** chip (`@today`, `@tomorrow`, `@week`, `@due`, `@overdue`) — not both; the UI keeps status and tagged date mutually exclusive when you are not in journal mode. You can still type **`@task`** in the search box to scope to tasks.
 
 Those pieces are combined and run together, so—for example—`report #client` with **Today** and **Done** asks Thymer for results that match **all** of those constraints (as its search language defines).
 
