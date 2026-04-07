@@ -1,10 +1,10 @@
 /**
- * Enhanced Search — Thymer plugin v1.1.8
+ * Enhanced Search — Thymer plugin v1.1.9
  * Cross-collection record viewer with filters (see README).
  * Modes: Search, Duplicates (analysis), Compare (2–3 notes + diff).
  */
 const PLUGIN_NAME = 'Enhanced Search';
-const PLUGIN_VERSION = '1.1.8';
+const PLUGIN_VERSION = '1.1.9';
 
 /** Skip duplicate/similar scans above this many records (per selected collections). */
 const DUPLICATE_SCAN_MAX_RECORDS = 2500;
@@ -549,6 +549,7 @@ class Plugin extends AppPlugin {
 
   /**
    * Insert MOC as real line items with `ref` segments so links resolve in the editor.
+   * Collection headings use plain Markdown `## …` (a leading newline before the 2nd+ heading); record lines are plain `ref` rows (no bullets).
    * `insertFromMarkdown` does not turn `[[…]]` into record refs — only Copy still emits that text.
    * @param {PluginRecord} record
    * @param {{ record: object, lineItems?: object[] }[]} mergedRows
@@ -562,24 +563,23 @@ class Plugin extends AppPlugin {
     const h1 = await record.createLineItem(null, afterItem, 'heading', [{ type: 'text', text: 'Map of content' }], null);
     await h1.setHeadingSize(1);
     afterItem = h1;
-    for (const { col, items } of groups) {
+    for (let gi = 0; gi < groups.length; gi++) {
+      const { col, items } = groups[gi];
       const headingText = col.replace(/\r|\n/g, ' ').trim() || '(no collection)';
-      const h2 = await record.createLineItem(null, afterItem, 'heading', [{ type: 'text', text: headingText }], null);
-      await h2.setHeadingSize(2);
-      afterItem = h2;
+      const md = gi === 0 ? `## ${headingText}\n` : `\n## ${headingText}\n`;
+      await record.insertFromMarkdown(md, null, afterItem);
+      const lastAfterHeading = await _mocLastTopLineItem(record);
+      if (lastAfterHeading) afterItem = lastAfterHeading;
       if (!items.length) continue;
-      const ulist = await record.createLineItem(null, afterItem, 'ulist', null, null);
-      afterItem = ulist;
-      let prevInList = null;
       for (const { title, guid } of items) {
         const li = await record.createLineItem(
-          ulist,
-          prevInList,
+          null,
+          afterItem,
           'text',
           [{ type: 'ref', text: _mocRefPayload(title, guid) }],
           null
         );
-        prevInList = li;
+        afterItem = li;
       }
     }
   }
@@ -2564,9 +2564,9 @@ function _resultsToolbarHtml(pageStart, batchLen, total, pageSize, isJournal, so
       <span class="rv-page-per">Per page</span>
       ${sizes}
       <span>·</span>
-      <button type="button" class="rv-link rv-expand-all">expand all</button>
+      <button type="button" class="rv-link rv-expand-all">expand</button>
       <span>·</span>
-      <button type="button" class="rv-link rv-collapse-all">collapse all</button>
+      <button type="button" class="rv-link rv-collapse-all">collapse</button>
       <span>·</span>
       <button type="button" class="rv-link rv-copy-csv" title="Copy results as CSV (Title, Collection, Record ID, Match line)">CSV</button>
       <span>·</span>
@@ -3918,6 +3918,13 @@ function _formatSearchRowsForClipboard(rows, recordColMap) {
   return lines.join('\n');
 }
 
+/** Last top-level line item (for chaining after `insertFromMarkdown` headings). */
+async function _mocLastTopLineItem(record) {
+  const items = await record.getLineItems(false);
+  const arr = Array.isArray(items) ? items : items ? [items] : [];
+  return arr.length ? arr[arr.length - 1] : null;
+}
+
 /**
  * Wiki-style text for **Copy** / clipboard. `@Foo` is not a note link (reserved for filters).
  * Pasting `[[Note title]]` into Thymer may resolve like the Obsidian importer; **`insertFromMarkdown`
@@ -3966,16 +3973,20 @@ function _groupSearchRowsForMoc(rows, recordColMap) {
 }
 
 /**
- * Markdown “map of content”: `# Map of content`, then `## collection` headings with `- [[title]]` bullets.
+ * Markdown “map of content”: `# Map of content`, then `## collection` and one `[[title]]` per line (no list bullets).
+ * A blank line is inserted before each `##` from the 2nd collection onward.
  */
 function _formatSearchRowsForMoc(rows, recordColMap) {
   const groups = _groupSearchRowsForMoc(rows, recordColMap);
   const lines = ['# Map of content', ''];
-  for (const { col, items } of groups) {
+  for (let gi = 0; gi < groups.length; gi++) {
+    const { col, items } = groups[gi];
     const heading = col.replace(/\r|\n/g, ' ').trim() || '(no collection)';
+    if (gi > 0) lines.push('');
     lines.push(`## ${heading}`);
+    lines.push('');
     for (const { title, guid } of items) {
-      lines.push(`- ${_mocWikiLink(title, guid)}`);
+      lines.push(_mocWikiLink(title, guid));
     }
     lines.push('');
   }
@@ -4186,7 +4197,7 @@ const SHELL_HTML = `
           <option value="replace">Replace entire note</option>
         </select>
       </div>
-      <p class="rv-moc-hint">Writing to a note inserts <strong>clickable links</strong> to each result. Copy only uses <code>[[…]]</code> Markdown text.</p>
+      <p class="rv-moc-hint">Writing to a note inserts <strong>clickable links</strong> (one line per note; <code>##</code> headings per collection). Copy only uses Markdown <code>[[…]]</code> text (no list bullets).</p>
       <div class="rv-moc-actions">
         <button type="button" class="rv-link rv-moc-cancel">Cancel</button>
         <button type="button" class="rv-link rv-moc-copy-only">Copy only</button>

@@ -1,13 +1,18 @@
 # Enhanced Search — Thymer Plugin
 
-**Version 1.1.8**
+**Version 1.1.9**
 
 Cross-collection record viewer with **Search**, **Duplicates**, and **Compare** modes: filters for text, hashtags, tagged dates, task status, journal day/range, and collections; duplicate and similar title/body analysis (optional property fields in body); side-by-side compare with line diff and keyed property diff for two or three notes; and presets for search and duplicate settings.
+
+### 1.1.9
+
+- **MOC (Map of content):** Collection titles are plain Markdown **`##`** headings only (no `++` / HTML underline). **Write** and **Copy** insert an **extra newline / blank line** before the **2nd and later** collection sections so blocks are spaced apart.
+- **Results toolbar:** Card list controls are labeled **expand** and **collapse** (replacing “expand all” / “collapse all”).
 
 ### 1.1.8
 
 - **Task status:** **In progress** uses **`@inprogress`** in the Thymer query (the old **Started** / `@started` chip is removed). With **several** task-status chips selected, the plugin joins their tokens with **`OR`** (e.g. `@done OR @inprogress`). Saved presets that still reference `started` load as **In progress**.
-- **MOC (Map of content):** **Write to a note** inserts **clickable** links to each result (native record references in the editor). **Copy only** still copies Markdown with `- [[…]]`-style bullets for use elsewhere. **New note** waits until the created record is available before writing; **New note** / **Existing note** blocks in the dialog show and hide correctly.
+- **MOC (Map of content):** **Write to a note** inserts **clickable** links to each result (native record references in the editor), **one line per note**, with plain **`##`** collection headings. **Copy only** copies the same Markdown style (`[[…]]` links, **no** list bullets). **New note** waits until the created record is available before writing; **New note** / **Existing note** blocks in the dialog show and hide correctly.
 
 ## Modes
 
@@ -35,7 +40,8 @@ In the sidebar (Search mode), sections run **Tagged date** → **Journal date** 
 - **Match lines on cards** — Under the title, each **line hit** shows a snippet of matching text. A small **checkbox icon** appears only when that hit is a **task** line (done vs open); plain text, headings, and other line types have **no** checkbox icon.
 - **Highlighting (plain search text)** — If the search box has **no `@` and no `#`** anywhere, words from the box (skipping boolean/operator tokens like `OR`, `AND`, …) are **highlighted** inside those snippets: **case-insensitive substring** matches (including **partial** words, e.g. `run` in `running`). Long snippets are **clipped** to fit, preferring a window that includes the **first** highlighted match. Highlights use a **bright yellow** background with dark text for contrast.
 - **CSV** — In the results toolbar (**CSV**), copies the **full current result list** (after **Filter results**, if any) to the clipboard as **CSV** (comma-separated): **Title**, **Collection**, **Record ID**, and **Match line** — one row per note, header row included; fields that contain commas or quotes are quoted per usual CSV rules (pastes cleanly into spreadsheets). The same control appears on the Compare card list.
-- **MOC** — Next to CSV (**MOC**), opens a dialog: **Write** builds the same **grouped list** (by collection) into a **new note** (pick collection + title; journal collections are not used for new notes) or an **existing note** (pick collection, then note), using **clickable record links** in the editor—not plain `[[…]]` Markdown paste. For existing notes with content, choose **Append to end** or **Replace entire note** (replace asks for confirmation). **Copy only** copies **Markdown** (`- [[…]]` bullets) to the clipboard without writing. After a successful write, the plugin opens that note in a new editor panel.
+- **expand / collapse** — Toolbar links to expand or collapse **all** card previews in the current list.
+- **MOC** — Next to CSV (**MOC**), opens a dialog: **Write** builds the same **grouped list** (by collection) into a **new note** (pick collection + title; journal collections are not used for new notes) or an **existing note** (pick collection, then note), using **clickable record links** in the editor—not plain `[[…]]` Markdown paste. Collection names use plain **`##`** headings; each note is **one line** (no list bullets). A **blank line** precedes the **2nd and later** collection headings in both **Write** and **Copy**. For existing notes with content, choose **Append to end** or **Replace entire note** (replace asks for confirmation). **Copy only** copies **Markdown** (`##` titles, `[[…]]` links, no `-` bullets) to the clipboard without writing. After a successful write, the plugin opens that note in a new editor panel.
 - **Presets** — Save and reload combinations of search filters (search text, status, tagged date, journal date, range, collections, include #types, sort, **Filter results** text).
 - **Open a result** — Click a card to open the record in a panel.
 
@@ -89,7 +95,7 @@ The plugin sends **one** query (e.g. `your words @today`). How strictly text and
 **Journal date (different mode)**  
 When you use the **Journal date** picker (prev/next day, last week / today / next week shortcuts), the plugin loads journal pages for the chosen **day and range** (1 / 3 / 7 days). It does **not** run the same combined “search box + tagged date + status” query for that flow. Turn journal date off to go back to normal search.
 
-Journal date mode does **not** hide pages because of blank **Last modified** or empty body text — if Thymer returns a journal record for that day (or within the range), it is listed. Result cards start with the **preview expanded** (you can collapse with the chevron or **collapse all**).
+Journal date mode does **not** hide pages because of blank **Last modified** or empty body text — if Thymer returns a journal record for that day (or within the range), it is listed. Result cards start with the **preview expanded** (you can collapse with the chevron or **collapse**).
 
 **Empty search**  
 If you leave the search box empty and don’t use status or tagged date, the plugin can show records from the selected collections without a text query (depending on what’s active).
