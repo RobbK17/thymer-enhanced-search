@@ -1,8 +1,36 @@
 # Enhanced Search — Thymer Plugin
 
-**Version 1.1.9**
+**Version 1.2.0**
 
 Cross-collection record viewer with **Search**, **Duplicates**, and **Compare** modes: filters for text, hashtags, tagged dates, task status, journal day/range, and collections; duplicate and similar title/body analysis (optional property fields in body); side-by-side compare with line diff and keyed property diff for two or three notes; and presets for search and duplicate settings.
+
+### 1.2.0 — Performance & refactoring
+
+Internal refactoring focused on reducing memory usage, improving responsiveness, and shrinking the codebase without changing user-facing functionality.
+
+**Performance**
+
+- **Lazy collection loading** — Collection record metadata is loaded on demand per collection instead of all at once on panel open, reducing initial memory footprint.
+- **Parallel data fetching** — Duplicate scan, type-field matching, and body-text extraction now run across collections concurrently instead of sequentially.
+- **Bounded concurrency for body extraction** — Body text extraction processes records in parallel batches, reducing wall-clock time for duplicate body scans.
+- **Chunked duplicate rendering** — Duplicate groups render in batches of 10 with progressive DOM insertion, keeping the UI responsive during large scans.
+- **Collection lookups** — A collections map (GUID to collection) replaces linear scans throughout the plugin.
+- **Cached journal flag** — `isJournal` is stored in collection metadata at index time, eliminating repeated function calls per record.
+- **Highlight regex built once** — The search-highlight regex is compiled once per card batch and reused across all hit lines, instead of being rebuilt per line per card.
+- **No auto-search on open** — The panel opens to an empty state prompt instead of running a search immediately, deferring all data loading until the user acts.
+- **Deferred card previews** — `getLineItems` and `getAllProperties` calls are deferred until a card is expanded, with results cached per record GUID.
+- **Infinite scroll** — Search results use an IntersectionObserver-based virtual list instead of fixed pagination, loading cards progressively as the user scrolls.
+- **Preview cache** — Rendered card preview HTML is cached per record GUID and reused across expand/collapse cycles within the same search session.
+
+**Refactoring**
+
+- Extracted `_getSelectedColGuids` helper — replaces 10 duplicate inline DOM queries.
+- Unified `_renderPresetList` — search and duplicate preset rendering share one method.
+- Extracted `_openRecordPanel` — consolidates three separate create-panel-and-navigate blocks.
+- Merged `_propDisplayValue` — two near-identical property display functions unified into one.
+- Consolidated CSS for diff property cells — shared missing-cell styles between two-pane and triple-pane diffs.
+- Extracted `_safeAlert` — replaces 10 try/catch alert wrappers with a single utility.
+- **Bug fix:** Removed stray token after `return` in `_journalDaysForRange` (span7 case) that would cause a runtime error.
 
 ### 1.1.9
 

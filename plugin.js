@@ -1,10 +1,10 @@
 /**
- * Enhanced Search — Thymer plugin v1.1.9
+ * Enhanced Search — Thymer plugin v1.2.0
  * Cross-collection record viewer with filters (see README).
  * Modes: Search, Duplicates (analysis), Compare (2–3 notes + diff).
  */
 const PLUGIN_NAME = 'Enhanced Search';
-const PLUGIN_VERSION = '1.1.9';
+const PLUGIN_VERSION = '1.2.0';
 
 /** Skip duplicate/similar scans above this many records (per selected collections). */
 const DUPLICATE_SCAN_MAX_RECORDS = 2500;
@@ -34,7 +34,7 @@ function _journalDaysForRange(anchor, range) {
     return [-1, 0, 1, 2, 3, 4, 5, 6].map(off => {
       const d = new Date(d0);
       d.setDate(d.getDate() + off);
-      return d;a
+      return d;
     });
   }
   return [d0];
@@ -50,6 +50,21 @@ class Plugin extends AppPlugin {
   _pageStart = 0;
   _pageSize = 50;
   _isJournalResults = false;
+  /** Set of collection GUIDs whose records have been indexed into `_recordColMap`. */
+  _recordColMapLoadedCols = new Set();
+  /** IntersectionObserver for infinite scroll in search mode. */
+  _scrollObserver = null;
+  /** Merged rows cached for infinite-scroll append. */
+  _scrollMergedRows = null;
+  /** How many cards have been rendered so far in the current infinite-scroll session. */
+  _scrollRenderedCount = 0;
+  _scrollLoading = false;
+  /** Cached preview-inner HTML keyed by record GUID — survives re-renders until a new search runs. */
+  _cardPreviewCache = new Map();
+  /** Merged (unique-record) count of `_matchRows`, set once when search completes — avoids re-merging in render path. */
+  _matchRowsMergedCount = 0;
+  /** Fast GUID to PluginCollectionAPI lookup (built once per panel init). */
+  _collectionsMap = new Map();
   /** When false, search used `@collection=…` — don’t filter results/cards by sidebar checkboxes. */
   _filterRecordsByCollectionCheckboxes = true;
 
@@ -97,6 +112,7 @@ class Plugin extends AppPlugin {
   }
 
   onUnload() {
+    this._teardownScrollObserver();
     this._viewerPanelsById.clear();
   }
 
@@ -152,11 +168,9 @@ class Plugin extends AppPlugin {
     });
     el.innerHTML = SHELL_HTML;
 
-    // Show loading while building collection map
     el.querySelector('.rv-results').innerHTML =
       '<div class="rv-loading"><span class="rv-spin ti ti-refresh"></span> Loading collections…</div>';
 
-    // Load all collections and pre-build recordGuid -> col meta map
     const cols = await this.data.getAllCollections();
     this._collections = [...cols].sort((a, b) => {
       const na = String(a.getName() || '').toLowerCase();
@@ -165,18 +179,9 @@ class Plugin extends AppPlugin {
       return c !== 0 ? c : String(a.getGuid()).localeCompare(String(b.getGuid()));
     });
     this._recordColMap = {};
-
-    await Promise.all(this._collections.map(async col => {
-      try {
-        const records = await col.getAllRecords();
-        const meta = {
-          colName: col.getName(),
-          colIcon: col.getConfiguration().icon || 'file-text',
-          colGuid: col.getGuid(),
-        };
-        for (const r of records) this._recordColMap[r.guid] = meta;
-      } catch { /* skip */ }
-    }));
+    this._recordColMapLoadedCols = new Set();
+    this._collectionsMap = new Map();
+    for (const col of this._collections) this._collectionsMap.set(col.getGuid(), col);
 
     // Build collection checkboxes (alphabetical by name)
     const colList = el.querySelector('.rv-col-list');
@@ -228,7 +233,7 @@ class Plugin extends AppPlugin {
     this._renderDupPresets(el);
     this._updateTypeSearchCheckboxVisibility(el);
     this._applyPanelMode(el);
-    this._runSearch(el);
+    this._showEmptySearchState(el);
   }
 
   _readPageSize() {
@@ -263,18 +268,47 @@ class Plugin extends AppPlugin {
     btn.hidden = !input.value.trim();
   }
 
+  _showEmptySearchState(el) {
+    const results = el.querySelector('.rv-results');
+    if (!results) return;
+    this._matchRows = [];
+    results.innerHTML = `<div class="rv-empty"><span class="ti ti-search"></span><div>Enter a search term or select filters</div><div class="rv-empty-sub">Type <b>*</b> for all records</div></div>`;
+  }
+
+  /** Index records for the given collection GUIDs into `_recordColMap` (skips already-indexed). */
+  async _ensureRecordColMap(selectedGuids) {
+    const needed = [];
+    for (const guid of selectedGuids) {
+      if (!this._recordColMapLoadedCols.has(guid)) needed.push(guid);
+    }
+    if (!needed.length) return;
+    await Promise.all(needed.map(async colGuid => {
+      const col = this._collectionsMap.get(colGuid);
+      if (!col) return;
+      try {
+        const records = await col.getAllRecords();
+        const isJournal = typeof col.isJournalPlugin === 'function' && col.isJournalPlugin();
+        const meta = {
+          colName: col.getName(),
+          colIcon: col.getConfiguration().icon || 'file-text',
+          colGuid: col.getGuid(),
+          isJournal,
+        };
+        for (const r of records) this._recordColMap[r.guid] = meta;
+        this._recordColMapLoadedCols.add(colGuid);
+      } catch { /* skip */ }
+    }));
+  }
+
   /** True if this record's collection is a journal plugin (used to apply blank-journal filter in mixed search). */
   _isJournalCollectionRecord(record) {
-    const meta = this._recordColMap[record.guid];
-    if (!meta) return false;
-    const col = this._collections.find(c => c.getGuid() === meta.colGuid);
-    return !!(col && typeof col.isJournalPlugin === 'function' && col.isJournalPlugin());
+    return !!(this._recordColMap[record.guid]?.isJournal);
   }
 
   /** True if any checked collection defines an active **choice** field named type or types. */
   _selectedCollectionsHaveTypeField(selectedGuids) {
     for (const guid of selectedGuids) {
-      const col = this._collections.find(c => c.getGuid() === guid);
+      const col = this._collectionsMap.get(guid);
       if (col && _collectionHasTypeField(col)) return true;
     }
     return false;
@@ -285,33 +319,36 @@ class Plugin extends AppPlugin {
    * search: plain words plus each #hashtag (with and without #). Ensures _recordColMap for hits.
    */
   async _recordsMatchingTypeField(texts, tags, selectedGuids) {
-    const out = [];
-    const seen = new Set();
     const needles = _typeSearchNeedles(texts, tags);
-    if (!needles.length) return out;
+    if (!needles.length) return [];
 
-    for (const col of this._collections) {
-      if (!selectedGuids.has(col.getGuid())) continue;
+    const eligible = this._collections
+      .filter(col => selectedGuids.has(col.getGuid()) && _typeChoiceFieldKeysForCollection(col).length);
+    const batches = await Promise.all(eligible.map(async col => {
       const typeKeys = _typeChoiceFieldKeysForCollection(col);
-      if (!typeKeys.length) continue;
+      const isJournal = typeof col.isJournalPlugin === 'function' && col.isJournalPlugin();
       const colMeta = {
         colName: col.getName(),
         colIcon: col.getConfiguration().icon || 'file-text',
         colGuid: col.getGuid(),
+        isJournal,
       };
-      let all;
       try {
-        all = await col.getAllRecords();
-      } catch {
-        continue;
-      }
-      for (const record of all) {
+        const all = await col.getAllRecords();
+        return { records: all, colMeta, typeKeys };
+      } catch { return null; }
+    }));
+    const out = [];
+    const seen = new Set();
+    for (const batch of batches) {
+      if (!batch) continue;
+      for (const record of batch.records) {
         if (seen.has(record.guid)) continue;
-        const hay = _recordTypeChoiceFieldBlob(record, typeKeys);
+        const hay = _recordTypeChoiceFieldBlob(record, batch.typeKeys);
         if (!hay) continue;
         if (!needles.some(n => hay.includes(n))) continue;
         seen.add(record.guid);
-        if (!this._recordColMap[record.guid]) this._recordColMap[record.guid] = colMeta;
+        if (!this._recordColMap[record.guid]) this._recordColMap[record.guid] = batch.colMeta;
         out.push(record);
       }
     }
@@ -344,9 +381,7 @@ class Plugin extends AppPlugin {
     const wrap = el.querySelector('.rv-search-include-type-wrap');
     const cb = el.querySelector('.rv-search-include-type');
     if (!wrap || !cb) return;
-    const selectedGuids = new Set(
-      [...el.querySelectorAll('.rv-col-list input:checked')].map(inp => inp.dataset.colGuid)
-    );
+    const selectedGuids = _getSelectedColGuids(el);
     const show = this._selectedCollectionsHaveTypeField(selectedGuids);
     wrap.style.display = show ? 'flex' : 'none';
     if (!show) cb.checked = false;
@@ -439,9 +474,7 @@ class Plugin extends AppPlugin {
 
   async _openMocDialog(el) {
     if (!this._buildMocMarkdown(el)) {
-      try {
-        alert('No results to export. Run a search or compare query first.');
-      } catch { /* ignore */ }
+      _safeAlert('No results to export. Run a search or compare query first.');
       return;
     }
     const nr = el.querySelector('input[name="rv-moc-mode"][value="new"]');
@@ -474,7 +507,7 @@ class Plugin extends AppPlugin {
     selEx.innerHTML = opts();
     if (this._collections?.length) {
       const firstNonJournal = this._collections.find(
-        c => !(typeof c.isJournalPlugin === 'function' && c.isJournalPlugin())
+        c => !(typeof c.isJournalPlugin === 'function' && c.isJournalPlugin()),
       );
       if (firstNonJournal) selNew.value = firstNonJournal.getGuid();
       selEx.value = this._collections[0].getGuid();
@@ -498,7 +531,7 @@ class Plugin extends AppPlugin {
     if (!sel) return;
     sel.innerHTML = '<option value="">— Select note —</option>';
     if (!colGuid) return;
-    const col = this._collections.find(c => c.getGuid() === colGuid);
+    const col = this._collectionsMap.get(colGuid);
     if (!col) return;
     let records = [];
     try {
@@ -607,83 +640,50 @@ class Plugin extends AppPlugin {
     return this.data.getRecord(guid);
   }
 
-  async _mocOpenWrittenNote(panel, guid) {
-    const newPanel = await this.ui.createPanel({ afterPanel: panel });
-    if (newPanel) {
-      newPanel.navigateTo({
-        type: 'edit_panel',
-        rootId: guid,
-        subId: null,
-        workspaceGuid: this.getWorkspaceGuid(),
-      });
-    }
+  async _openRecordPanel(afterPanel, guid) {
+    const p = await this.ui.createPanel({ afterPanel });
+    if (p) p.navigateTo({ type: 'edit_panel', rootId: guid, subId: null, workspaceGuid: this.getWorkspaceGuid() });
   }
 
   async _mocWriteToNote(el, panel) {
     const merged = this._getMergedClipboardRows(el);
     if (!merged?.length) {
-      try {
-        alert('No results to export.');
-      } catch { /* ignore */ }
+      _safeAlert('No results to export.');
       return;
     }
     const mode = el.querySelector('input[name="rv-moc-mode"]:checked')?.value || 'new';
     if (mode === 'new') {
       const colGuid = el.querySelector('.rv-moc-col-new')?.value;
       const title = el.querySelector('.rv-moc-title-new')?.value?.trim() || 'Map of content';
-      const col = this._collections.find(c => c.getGuid() === colGuid);
+      const col = this._collectionsMap.get(colGuid);
       if (!colGuid || !col) {
-        try {
-          alert('Select a collection.');
-        } catch { /* ignore */ }
+        _safeAlert('Select a collection.');
         return;
       }
       if (typeof col.isJournalPlugin === 'function' && col.isJournalPlugin()) {
-        try {
-          alert('Choose a non-journal collection for a new note, or use “Existing note” for a journal page.');
-        } catch { /* ignore */ }
+        _safeAlert('Choose a non-journal collection for a new note, or use "Existing note" for a journal page.');
         return;
       }
       const guid = col.createRecord(title);
-      if (!guid) {
-        try {
-          alert('Could not create note in that collection.');
-        } catch { /* ignore */ }
-        return;
-      }
+      if (!guid) { _safeAlert('Could not create note in that collection.'); return; }
       const record = await this._waitForDataRecord(guid);
-      if (!record) {
-        try {
-          alert('Created note could not be opened.');
-        } catch { /* ignore */ }
-        return;
-      }
+      if (!record) { _safeAlert('Created note could not be opened.'); return; }
       try {
         await this._mocInsertStructuredContent(record, merged, this._recordColMap, null);
       } catch (e) {
-        try {
-          alert('Could not write content: ' + (e?.message || String(e)));
-        } catch { /* ignore */ }
+        _safeAlert('Could not write content: ' + (e?.message || String(e)));
         return;
       }
       this._closeMocDialog(el);
-      await this._mocOpenWrittenNote(panel, guid);
+      await this._openRecordPanel(panel, guid);
       return;
     }
     const recGuid = el.querySelector('.rv-moc-record-select')?.value;
     if (!recGuid) {
-      try {
-        alert('Select a note.');
-      } catch { /* ignore */ }
-      return;
+      _safeAlert('Select a note.'); return;
     }
     const record = this.data.getRecord(recGuid);
-    if (!record) {
-      try {
-        alert('Note not found.');
-      } catch { /* ignore */ }
-      return;
-    }
+    if (!record) { _safeAlert('Note not found.'); return; }
     const wantAppend = el.querySelector('.rv-moc-append-mode')?.value === 'append';
     let hasBody = false;
     try {
@@ -708,13 +708,11 @@ class Plugin extends AppPlugin {
         await this._mocInsertStructuredContent(record, merged, this._recordColMap, null);
       }
     } catch (e) {
-      try {
-        alert('Could not write: ' + (e?.message || String(e)));
-      } catch { /* ignore */ }
+      _safeAlert('Could not write: ' + (e?.message || String(e)));
       return;
     }
     this._closeMocDialog(el);
-    await this._mocOpenWrittenNote(panel, recGuid);
+    await this._openRecordPanel(panel, recGuid);
   }
 
   _bindMocDialog(el, panel) {
@@ -737,14 +735,13 @@ class Plugin extends AppPlugin {
 
   async _renderSearchPageFromMatchRecords(el) {
     if (this._panelMode !== 'search') return;
+    this._teardownScrollObserver();
     const sortMode = this._captureSortMode(el);
     const results = el.querySelector('.rv-results');
     if (!results) return;
     const list = this._matchRows;
     if (!list?.length) return;
-    const selectedGuids = new Set(
-      [...el.querySelectorAll('.rv-col-list input:checked')].map(cb => cb.dataset.colGuid)
-    );
+    const selectedGuids = _getSelectedColGuids(el);
     const filterRaw = el.querySelector('.rv-search-results-filter')?.value ?? '';
     const { filtered: visibleFlat, totalBeforeFilter } = _filterSearchRows(
       list,
@@ -753,7 +750,7 @@ class Plugin extends AppPlugin {
     );
     const visible = _mergeSearchRowsByRecord(visibleFlat);
     const totalBeforeMerged = String(filterRaw || '').trim()
-      ? _mergeSearchRowsByRecord(list).length
+      ? this._matchRowsMergedCount
       : visible.length;
     if (!visible.length) {
       if (totalBeforeFilter > 0) {
@@ -763,27 +760,29 @@ class Plugin extends AppPlugin {
     }
     const isJournal = this._isJournalResults;
     const expandPreview = isJournal;
-    this._pageStart = Math.min(this._pageStart, Math.max(0, visible.length - 1));
     const total = visible.length;
-    const firstBatch = visible.slice(this._pageStart, this._pageStart + this._pageSize);
+    const firstBatch = visible.slice(0, this._pageSize);
     const hasFilter = String(filterRaw || '').trim().length > 0;
     const toolbarOpts =
       hasFilter && totalBeforeMerged > total ? { listFilterTotalBefore: totalBeforeMerged } : {};
+    toolbarOpts.noLoadMoreBar = true;
     const activeTaskStatuses = _activeTaskStatusSet(el);
     const searchRaw = el.querySelector('.rv-search-input')?.value ?? '';
     const highlightTerms = _plainSearchHighlightTermsFromQuery(searchRaw);
+    const highlightRegex = highlightTerms ? _searchHighlightSubstringRegex(highlightTerms) : null;
     const cards = await Promise.all(
       firstBatch.map(row =>
         this._buildCard(row, selectedGuids, expandPreview, {
           compareBtn: true,
           activeTaskStatuses,
           highlightTerms,
+          highlightRegex,
         })
       )
     );
     const validCards = cards.filter(Boolean);
     const toolbar = _resultsToolbarHtml(
-      this._pageStart,
+      0,
       firstBatch.length,
       total,
       this._pageSize,
@@ -791,9 +790,89 @@ class Plugin extends AppPlugin {
       sortMode,
       toolbarOpts
     );
-    results.innerHTML = toolbar + '<div class="rv-cards-list">' + validCards.join('') + '</div>';
+    const sentinel = firstBatch.length < total
+      ? '<div class="rv-scroll-sentinel" aria-hidden="true"></div>'
+      : '';
+    results.innerHTML = toolbar + '<div class="rv-cards-list">' + validCards.join('') + '</div>' + sentinel;
+    this._scrollRenderedCount = firstBatch.length;
+    this._scrollMergedRows = visible;
+    if (firstBatch.length < total) this._setupScrollObserver(el);
     const main = el.querySelector('.rv-main');
     if (main) main.scrollTop = 0;
+  }
+
+  _setupScrollObserver(el) {
+    const sentinel = el.querySelector('.rv-scroll-sentinel');
+    const main = el.querySelector('.rv-main');
+    if (!sentinel || !main) return;
+    this._scrollObserver = new IntersectionObserver(entries => {
+      if (entries[0]?.isIntersecting) void this._appendMoreSearchCards(el);
+    }, { root: main, rootMargin: '200px' });
+    this._scrollObserver.observe(sentinel);
+  }
+
+  _teardownScrollObserver() {
+    if (this._scrollObserver) {
+      this._scrollObserver.disconnect();
+      this._scrollObserver = null;
+    }
+    this._scrollMergedRows = null;
+    this._scrollRenderedCount = 0;
+    this._scrollLoading = false;
+  }
+
+  async _appendMoreSearchCards(el) {
+    if (this._scrollLoading) return;
+    const rows = this._scrollMergedRows;
+    if (!rows) return;
+    const start = this._scrollRenderedCount;
+    if (start >= rows.length) return;
+    this._scrollLoading = true;
+    try {
+      const batch = rows.slice(start, start + this._pageSize);
+      if (!batch.length) return;
+      const selectedGuids = _getSelectedColGuids(el);
+      const isJournal = this._isJournalResults;
+      const expandPreview = isJournal;
+      const activeTaskStatuses = _activeTaskStatusSet(el);
+      const searchRaw = el.querySelector('.rv-search-input')?.value ?? '';
+      const highlightTerms = _plainSearchHighlightTermsFromQuery(searchRaw);
+      const highlightRegex = highlightTerms ? _searchHighlightSubstringRegex(highlightTerms) : null;
+      const cards = await Promise.all(
+        batch.map(row =>
+          this._buildCard(row, selectedGuids, expandPreview, {
+            compareBtn: true,
+            activeTaskStatuses,
+            highlightTerms,
+            highlightRegex,
+          })
+        )
+      );
+      const validCards = cards.filter(Boolean);
+      const cardsList = el.querySelector('.rv-cards-list');
+      if (cardsList && validCards.length) {
+        cardsList.insertAdjacentHTML('beforeend', validCards.join(''));
+      }
+      this._scrollRenderedCount = start + batch.length;
+      const countEl = el.querySelector('.rv-count');
+      if (countEl) {
+        const total = rows.length;
+        const loaded = this._scrollRenderedCount;
+        const noun = _countNoun(total, isJournal);
+        countEl.innerHTML = loaded >= total
+          ? `${total} ${noun}`
+          : `Showing ${loaded} of ${total} ${noun}`;
+      }
+      const sentinel = el.querySelector('.rv-scroll-sentinel');
+      if (this._scrollRenderedCount >= rows.length) {
+        sentinel?.remove();
+        this._scrollObserver?.disconnect();
+      } else if (sentinel && this._scrollObserver) {
+        this._scrollObserver.observe(sentinel);
+      }
+    } finally {
+      this._scrollLoading = false;
+    }
   }
 
   async _loadPrevPage(el) {
@@ -926,7 +1005,7 @@ class Plugin extends AppPlugin {
       titleVariant: !!el.querySelector('.rv-dup-title-variant')?.checked,
       includeBodyProps: !!el.querySelector('.rv-dup-body-include-props')?.checked,
       dupFilter: el.querySelector('.rv-dup-filter')?.value ?? '',
-      collections: [...el.querySelectorAll('.rv-col-list input:checked')].map(cb => cb.dataset.colGuid),
+      collections: [..._getSelectedColGuids(el)],
     };
   }
 
@@ -969,7 +1048,7 @@ class Plugin extends AppPlugin {
       search: el.querySelector('.rv-search-input').value,
       statuses: [...el.querySelectorAll('.rv-status-bar .rv-chip--active')].map(c => c.dataset.status),
       date: el.querySelector('.rv-date-bar .rv-chip--active')?.dataset.date || '',
-      collections: [...el.querySelectorAll('.rv-col-list input:checked')].map(cb => cb.dataset.colGuid),
+      collections: [..._getSelectedColGuids(el)],
       journalDate: this._journalDate ? this._journalDate.toISOString() : null,
       journalRange: this._readJournalRange(el),
       includeTypeSearch: !!el.querySelector('.rv-search-include-type')?.checked,
@@ -1022,60 +1101,33 @@ class Plugin extends AppPlugin {
 
   _dupPresetEditMode = false;
 
-  _renderPresets(el) {
-    const presets = this._getPresets();
-    const list = el.querySelector('.rv-preset-list');
+  _renderPresetList(el, presets, editing, prefix) {
+    const list = el.querySelector(`.${prefix}-list`);
+    if (!list) return;
     list.innerHTML = '';
-    if (presets.length === 0) {
+    if (!presets.length) {
       list.innerHTML = '<div class="rv-preset-empty">No saved presets yet</div>';
       return;
     }
     presets.forEach((preset, i) => {
       const row = document.createElement('div');
-      row.className = 'rv-preset-row';
-      if (this._presetEditMode) {
-        row.innerHTML = `
-          <span class="rv-preset-name-label">${_esc(preset.name)}</span>
-          <button class="rv-preset-del" data-index="${i}" title="Delete">
-            <span class="ti ti-trash"></span>
-          </button>`;
-      } else {
-        row.innerHTML = `
-          <button class="rv-preset-load" data-index="${i}">${_esc(preset.name)}</button>`;
-      }
+      row.className = `${prefix}-row`;
+      row.innerHTML = editing
+        ? `<span class="${prefix}-name-label">${_esc(preset.name)}</span>
+           <button type="button" class="${prefix}-del" data-index="${i}" title="Delete"><span class="ti ti-trash"></span></button>`
+        : `<button type="button" class="${prefix}-load" data-index="${i}">${_esc(preset.name)}</button>`;
       list.appendChild(row);
     });
-    // Update toggle button appearance
-    const toggle = el.querySelector('.rv-preset-edit-toggle');
-    if (toggle) toggle.style.opacity = this._presetEditMode ? '1' : '0.45';
+    const toggle = el.querySelector(`.${prefix}-edit-toggle`);
+    if (toggle) toggle.style.opacity = editing ? '1' : '0.45';
+  }
+
+  _renderPresets(el) {
+    this._renderPresetList(el, this._getPresets(), this._presetEditMode, 'rv-preset');
   }
 
   _renderDupPresets(el) {
-    const presets = this._getDupPresets();
-    const list = el.querySelector('.rv-dup-preset-list');
-    if (!list) return;
-    list.innerHTML = '';
-    if (presets.length === 0) {
-      list.innerHTML = '<div class="rv-preset-empty">No saved presets yet</div>';
-      return;
-    }
-    presets.forEach((preset, i) => {
-      const row = document.createElement('div');
-      row.className = 'rv-dup-preset-row';
-      if (this._dupPresetEditMode) {
-        row.innerHTML = `
-          <span class="rv-dup-preset-name-label">${_esc(preset.name)}</span>
-          <button type="button" class="rv-dup-preset-del" data-index="${i}" title="Delete">
-            <span class="ti ti-trash"></span>
-          </button>`;
-      } else {
-        row.innerHTML = `
-          <button type="button" class="rv-dup-preset-load" data-index="${i}">${_esc(preset.name)}</button>`;
-      }
-      list.appendChild(row);
-    });
-    const toggle = el.querySelector('.rv-dup-preset-edit-toggle');
-    if (toggle) toggle.style.opacity = this._dupPresetEditMode ? '1' : '0.45';
+    this._renderPresetList(el, this._getDupPresets(), this._dupPresetEditMode, 'rv-dup-preset');
   }
 
   _bindEvents(el) {
@@ -1485,7 +1537,7 @@ class Plugin extends AppPlugin {
     );
     const visible = _mergeSearchRowsByRecord(visibleFlat);
     const totalBeforeMerged = String(filterRaw || '').trim()
-      ? _mergeSearchRowsByRecord(this._matchRows).length
+      ? this._matchRowsMergedCount
       : visible.length;
     if (!visible.length) {
       results.innerHTML = `<div class="rv-empty"><span class="ti ti-search-off"></span><div>No notes match filter</div><div class="rv-empty-sub">${totalBeforeFilter} hidden — clear Filter list</div></div>`;
@@ -1493,9 +1545,7 @@ class Plugin extends AppPlugin {
     }
     const sortMode = this._captureSortMode(el);
     const total = visible.length;
-    const selectedGuids = new Set(
-      [...el.querySelectorAll('.rv-col-list input:checked')].map(cb => cb.dataset.colGuid)
-    );
+    const selectedGuids = _getSelectedColGuids(el);
     this._pageStart = Math.min(this._pageStart, Math.max(0, total - 1));
     const firstBatch = visible.slice(this._pageStart, this._pageStart + this._pageSize);
     const hasFilter = String(filterRaw || '').trim().length > 0;
@@ -1504,9 +1554,10 @@ class Plugin extends AppPlugin {
     const activeTaskStatuses = _activeTaskStatusSet(el);
     const searchRaw = el.querySelector('.rv-search-input')?.value ?? '';
     const highlightTerms = _plainSearchHighlightTermsFromQuery(searchRaw);
+    const highlightRegex = highlightTerms ? _searchHighlightSubstringRegex(highlightTerms) : null;
     Promise.all(
       firstBatch.map(row =>
-        this._buildCard(row, selectedGuids, false, { compareBtn: true, activeTaskStatuses, highlightTerms })
+        this._buildCard(row, selectedGuids, false, { compareBtn: true, activeTaskStatuses, highlightTerms, highlightRegex })
       )
     ).then(cards => {
       const validCards = cards.filter(Boolean);
@@ -1574,18 +1625,17 @@ class Plugin extends AppPlugin {
   }
 
   async _gatherRecordsForDuplicateScan(el) {
-    const selectedGuids = new Set(
-      [...el.querySelectorAll('.rv-col-list input:checked')].map(cb => cb.dataset.colGuid)
+    const selectedGuids = _getSelectedColGuids(el);
+    await this._ensureRecordColMap(selectedGuids);
+    const batches = await Promise.all(
+      this._collections
+        .filter(col => selectedGuids.has(col.getGuid()))
+        .map(async col => {
+          try { return await col.getAllRecords(); } catch { return []; }
+        })
     );
     const out = [];
-    for (const col of this._collections) {
-      if (!selectedGuids.has(col.getGuid())) continue;
-      let recs;
-      try {
-        recs = await col.getAllRecords();
-      } catch {
-        continue;
-      }
+    for (const recs of batches) {
       for (const r of recs) {
         if (!r) continue;
         if (this._isJournalCollectionRecord(r) && _isBlankLastModified(r)) continue;
@@ -1595,7 +1645,7 @@ class Plugin extends AppPlugin {
     return out;
   }
 
-  _renderDuplicateResults(el, groups) {
+  async _renderDuplicateResults(el, groups) {
     const results = el.querySelector('.rv-results');
     if (!results) return;
     if (!groups.length) {
@@ -1619,9 +1669,7 @@ class Plugin extends AppPlugin {
       return;
     }
     const totalNotes = filtered.reduce((s, g) => s + g.records.length, 0);
-    const selectedGuids = new Set(
-      [...el.querySelectorAll('.rv-col-list input:checked')].map(cb => cb.dataset.colGuid)
-    );
+    const selectedGuids = _getSelectedColGuids(el);
     const hasFilter = String(filterRaw || '').trim().length > 0;
     const nd = this._dupDismissedKeys.size;
     const countText = hasFilter
@@ -1649,9 +1697,16 @@ class Plugin extends AppPlugin {
 </div>`;
     };
 
-    Promise.all(filtered.map(buildGroup)).then(parts => {
-      results.innerHTML = head + `<div class="rv-dup-groups">${parts.join('')}</div>`;
-    });
+    const CHUNK = 10;
+    const container = document.createElement('div');
+    container.className = 'rv-dup-groups';
+    results.innerHTML = head;
+    results.appendChild(container);
+    for (let i = 0; i < filtered.length; i += CHUNK) {
+      const batch = filtered.slice(i, i + CHUNK);
+      const parts = await Promise.all(batch.map(buildGroup));
+      container.insertAdjacentHTML('beforeend', parts.join(''));
+    }
   }
 
   _openCompareDiff(el) {
@@ -1728,17 +1783,8 @@ class Plugin extends AppPlugin {
   }
 
   async _compareActionOpen(el, searchPanel, guid) {
-    const record = this.data.getRecord(guid);
-    if (!record) return;
-    const newPanel = await this.ui.createPanel({ afterPanel: searchPanel });
-    if (newPanel) {
-      newPanel.navigateTo({
-        type: 'edit_panel',
-        rootId: record.guid,
-        subId: null,
-        workspaceGuid: this.getWorkspaceGuid(),
-      });
-    }
+    if (!this.data.getRecord(guid)) return;
+    await this._openRecordPanel(searchPanel, guid);
   }
 
   // ─── Search ───────────────────────────────────────────────────────────────
@@ -1820,7 +1866,7 @@ class Plugin extends AppPlugin {
     if (el.querySelector('.rv-search-include-type')?.checked) {
       parts.push('include #types');
     }
-    const nCol = el.querySelectorAll('.rv-col-list input:checked').length;
+    const nCol = _getSelectedColGuids(el).size;
     if (nCol > 0) parts.push(`${nCol} collection${nCol === 1 ? '' : 's'}`);
     return parts.length ? parts.join(' · ') : '';
   }
@@ -1830,6 +1876,7 @@ class Plugin extends AppPlugin {
    */
   async _runSearch(el, opts = {}) {
     if (!opts.ignoreMode && this._panelMode !== 'search') return;
+    this._cardPreviewCache.clear();
     this._updateActiveSearchIndicators(el);
     const sortMode = this._captureSortMode(el);
     const results = el.querySelector('.rv-results');
@@ -1865,10 +1912,7 @@ class Plugin extends AppPlugin {
     if (activeDateChip) filterPartsOnly.push(activeDateChip.dataset.date);
     const filterQueryStructured = filterPartsOnly.join(' ').trim();
 
-    // Selected collection GUIDs
-    const selectedGuids = new Set(
-      [...el.querySelectorAll('.rv-col-list input:checked')].map(cb => cb.dataset.colGuid)
-    );
+    const selectedGuids = _getSelectedColGuids(el);
     const selectedGuidsForTypeMerge = thymerCollectionScope
       ? new Set(this._collections.map(c => c.getGuid()))
       : selectedGuids;
@@ -1888,6 +1932,7 @@ class Plugin extends AppPlugin {
 
     // If journal date is active, find journal records for that date (or range) across selected collections
     if (this._journalDate) {
+      await this._ensureRecordColMap(selectedGuids);
       this._filterRecordsByCollectionCheckboxes = true;
       this._journalRange = this._readJournalRange(el);
       const range = this._journalRange;
@@ -1928,6 +1973,7 @@ class Plugin extends AppPlugin {
         return;
       }
       this._matchRows = filtered.map(r => ({ record: r, lineItem: null }));
+      this._matchRowsMergedCount = filtered.length;
       this._isJournalResults = true;
       this._pageStart = 0;
       if (!opts.ignoreMode) await this._renderSearchPageFromMatchRecords(el);
@@ -1936,11 +1982,21 @@ class Plugin extends AppPlugin {
 
     let rows = [];
 
-    if (!query) {
-      // No filters active — pull directly from pre-built map, filtered by selected collections
+    const isShowAll = raw === '*';
+
+    if (!query && !isShowAll) {
+      this._matchRows = [];
+      if (!opts.ignoreMode) this._showEmptySearchState(el);
+      return;
+    }
+
+    await this._ensureRecordColMap(selectedGuids);
+
+    if (isShowAll) {
       const allGuids = Object.keys(this._recordColMap)
         .filter(guid => selectedGuids.has(this._recordColMap[guid].colGuid));
-      rows = allGuids.map(guid => this.data.getRecord(guid)).filter(Boolean).map(r => ({ record: r, lineItem: null }));
+      rows = allGuids.map(guid => this.data.getRecord(guid)).filter(Boolean)
+        .map(r => ({ record: r, lineItem: null }));
     } else {
       // Run search query then filter to selected collections
       const includeTypeSearch =
@@ -2033,6 +2089,7 @@ class Plugin extends AppPlugin {
 
     const sorted = _sortSearchRows(filtered, sortMode, this._recordColMap);
     this._matchRows = sorted;
+    this._matchRowsMergedCount = _mergeSearchRowsByRecord(sorted).length;
     this._isJournalResults = false;
     this._pageStart = 0;
     if (!opts.ignoreMode) await this._renderSearchPageFromMatchRecords(el);
@@ -2046,18 +2103,85 @@ class Plugin extends AppPlugin {
   async _buildCard(row, selectedGuids, expandPreview = false, opts = {}) {
     const record = row.record;
     const lineItems = Array.isArray(row.lineItems) ? row.lineItems : [];
-    // Fast O(1) lookup using pre-built map
     const meta = this._recordColMap[record.guid];
     const colName = meta ? meta.colName : '';
     const colIcon = meta ? meta.colIcon : 'file-text';
     const colGuid = meta ? meta.colGuid : null;
 
-    // Filter by sidebar collections (skipped when search used @collection=…)
     if (this._filterRecordsByCollectionCheckboxes && colGuid && !selectedGuids.has(colGuid)) return null;
 
-    const hitTexts = lineItems.map(li => _lineItemPlainText(li)).filter(Boolean);
+    const icon = record.getIcon(true) || ('ti-' + colIcon);
+    const name = record.getName() || '(untitled)';
+    const updatedAt = record.getUpdatedAt();
+    const timePart = updatedAt
+      ? `<span class="rv-card-time-sep"> · </span><span class="rv-card-time">${_esc(_fmtRel(updatedAt))}</span>`
+      : '';
 
-    // Full text excerpt for expanded preview (many lines); prioritize matching lines when present
+    const compareBtn = opts.compareBtn
+      ? `<button type="button" class="rv-card-compare-add" data-record-guid="${record.guid}" title="Add to compare">+</button>`
+      : '';
+
+    const taskStatusSet = opts.activeTaskStatuses instanceof Set ? opts.activeTaskStatuses : new Set();
+    const highlightTerms = Array.isArray(opts.highlightTerms) && opts.highlightTerms.length ? opts.highlightTerms : null;
+    const hlRegex = opts.highlightRegex || (highlightTerms ? _searchHighlightSubstringRegex(highlightTerms) : null);
+    const hitLineRows = lineItems
+      .map(li => {
+        const t = _lineItemPlainText(li);
+        if (!t) return '';
+        const liIcon = _lineItemHitCheckboxIcon(li, taskStatusSet);
+        const checkWrap = liIcon
+          ? `<span class="rv-card-hit-check-wrap" aria-hidden="true"><span class="ti ${liIcon}"></span></span>`
+          : '';
+        const display = highlightTerms
+          ? _truncateDisplayWithSearchHighlight(t, 220, highlightTerms)
+          : _truncateDisplay(t, 220);
+        const hitHtml = hlRegex
+          ? _highlightWithRegex(display, hlRegex)
+          : _esc(display);
+        return `<div class="rv-card-hit-line">${checkWrap}<span class="rv-card-hit-line-text">${hitHtml}</span></div>`;
+      })
+      .filter(Boolean);
+    const hitLineBlock = hitLineRows.length ? `<div class="rv-card-hit-lines">${hitLineRows.join('')}</div>` : '';
+
+    let previewInnerHtml;
+    if (expandPreview) {
+      const cached = this._cardPreviewCache.get(record.guid);
+      if (cached != null) {
+        previewInnerHtml = cached;
+      } else {
+        previewInnerHtml = await this._buildCardPreviewHtml(record, lineItems);
+        this._cardPreviewCache.set(record.guid, previewInnerHtml);
+      }
+    } else {
+      previewInnerHtml = '';
+    }
+
+    const openClass = expandPreview ? ' rv-card--preview-open' : '';
+    const lazyAttr = expandPreview ? '' : ' data-lazy-preview="true"';
+    return `
+<div class="rv-card has-expandable${openClass}" data-record-guid="${record.guid}"${lazyAttr}>
+  <div class="rv-card-header">
+    <button type="button" class="rv-card-preview-toggle" aria-label="Toggle details" title="Details" aria-expanded="${expandPreview ? 'true' : 'false'}">
+      <span class="rv-card-preview-chevron ti ti-chevron-right"></span>
+    </button>
+    <div class="rv-card-icon"><span class="ti ${icon}"></span></div>
+    <div class="rv-card-main">
+      <div class="rv-card-one-line">
+        <span class="rv-card-title">${_esc(name)}</span><span class="rv-card-col-bracket"> [${_esc(_truncateDisplay(colName, COLLECTION_NAME_IN_CARD_MAX))}]</span>${timePart}
+      </div>
+      ${hitLineBlock}
+    </div>
+    ${compareBtn}
+  </div>
+  <div class="rv-card-preview-inner">
+    ${previewInnerHtml}
+  </div>
+</div>`;
+  }
+
+  /** Build the expandable preview HTML (dates + body excerpt + property chips) for a card. */
+  async _buildCardPreviewHtml(record, lineItems) {
+    const hitTexts = (lineItems || []).map(li => _lineItemPlainText(li)).filter(Boolean);
     const previewChunks = [];
     try {
       const lines = await record.getLineItems(false);
@@ -2082,87 +2206,44 @@ class Plugin extends AppPlugin {
       previewChunks.push(...hitTexts, ...rest.slice(0, cap));
     }
     const previewText = previewChunks.join('\n\n');
-
     const updatedAt = record.getUpdatedAt();
-
-    // Drop collection fields that mirror record created/modified (prevents duplicate dates in expanded view).
     const props = record.getAllProperties().filter(p => !_isBuiltinTimestampProperty(p));
     const propChips = props
       .map(p => {
-        const val = _propDisplayExpanded(p, record);
+        const val = _propDisplayValue(p, record);
         if (!val) return '';
         return `<span class="rv-prop-chip"><span class="rv-prop-label">${_esc(p.field?.label || p.name || '')}</span><span class="rv-prop-val">${_esc(val)}</span></span>`;
       })
       .filter(Boolean)
       .join('');
-
-    // One line only: last modified (canonical record time; avoids repeating created + modified).
     const datesBlock = `
   <div class="rv-card-date-block">
     <div class="rv-card-date-line"><span class="rv-card-date-label">Last modified</span> ${_fmtDateTime(updatedAt)}</div>
   </div>`;
-
     const previewBlock = previewText
       ? `<div class="rv-card-preview-text" style="--rv-preview-lines:${PREVIEW_MAX_DISPLAY_LINES}">${_esc(previewText)}</div>`
       : '';
-
     const propsBlock = propChips
       ? `<div class="rv-card-props">${propChips}</div>`
       : '';
+    return `${datesBlock}${previewBlock}${propsBlock}`;
+  }
 
-    const icon = record.getIcon(true) || ('ti-' + colIcon);
-    const name = record.getName() || '(untitled)';
-    const timePart = updatedAt
-      ? `<span class="rv-card-time-sep"> · </span><span class="rv-card-time">${_esc(_fmtRel(updatedAt))}</span>`
-      : '';
-
-    const compareBtn = opts.compareBtn
-      ? `<button type="button" class="rv-card-compare-add" data-record-guid="${record.guid}" title="Add to compare">+</button>`
-      : '';
-
-    const taskStatusSet = opts.activeTaskStatuses instanceof Set ? opts.activeTaskStatuses : new Set();
-    const highlightTerms = Array.isArray(opts.highlightTerms) && opts.highlightTerms.length ? opts.highlightTerms : null;
-    const hitLineRows = lineItems
-      .map(li => {
-        const t = _lineItemPlainText(li);
-        if (!t) return '';
-        const icon = _lineItemHitCheckboxIcon(li, taskStatusSet);
-        const checkWrap = icon
-          ? `<span class="rv-card-hit-check-wrap" aria-hidden="true"><span class="ti ${icon}"></span></span>`
-          : '';
-        const display = highlightTerms
-          ? _truncateDisplayWithSearchHighlight(t, 220, highlightTerms)
-          : _truncateDisplay(t, 220);
-        const hitHtml = highlightTerms
-          ? _highlightPlainSearchTermsInText(display, highlightTerms)
-          : _esc(display);
-        return `<div class="rv-card-hit-line">${checkWrap}<span class="rv-card-hit-line-text">${hitHtml}</span></div>`;
-      })
-      .filter(Boolean);
-    const hitLineBlock = hitLineRows.length ? `<div class="rv-card-hit-lines">${hitLineRows.join('')}</div>` : '';
-
-    const openClass = expandPreview ? ' rv-card--preview-open' : '';
-    return `
-<div class="rv-card has-expandable${openClass}" data-record-guid="${record.guid}">
-  <div class="rv-card-header">
-    <button type="button" class="rv-card-preview-toggle" aria-label="Toggle details" title="Details" aria-expanded="${expandPreview ? 'true' : 'false'}">
-      <span class="rv-card-preview-chevron ti ti-chevron-right"></span>
-    </button>
-    <div class="rv-card-icon"><span class="ti ${icon}"></span></div>
-    <div class="rv-card-main">
-      <div class="rv-card-one-line">
-        <span class="rv-card-title">${_esc(name)}</span><span class="rv-card-col-bracket"> [${_esc(_truncateDisplay(colName, COLLECTION_NAME_IN_CARD_MAX))}]</span>${timePart}
-      </div>
-      ${hitLineBlock}
-    </div>
-    ${compareBtn}
-  </div>
-  <div class="rv-card-preview-inner">
-    ${datesBlock}
-    ${previewBlock}
-    ${propsBlock}
-  </div>
-</div>`;
+  /** Lazily load preview content for a card on first expand. */
+  async _loadCardPreview(card) {
+    const guid = card.dataset.recordGuid;
+    if (!guid) return;
+    delete card.dataset.lazyPreview;
+    const inner = card.querySelector('.rv-card-preview-inner');
+    if (!inner) return;
+    const cached = this._cardPreviewCache.get(guid);
+    if (cached != null) { inner.innerHTML = cached; return; }
+    inner.innerHTML = '<div class="rv-loading rv-loading--inline"><span class="rv-spin ti ti-refresh"></span></div>';
+    const record = this.data.getRecord(guid);
+    if (!record) { inner.innerHTML = ''; return; }
+    const html = await this._buildCardPreviewHtml(record, []);
+    this._cardPreviewCache.set(guid, html);
+    inner.innerHTML = html;
   }
 
   _bindCardActions(el, searchPanel) {
@@ -2219,6 +2300,7 @@ class Plugin extends AppPlugin {
           c.classList.add('rv-card--preview-open');
           const btn = c.querySelector('.rv-card-preview-toggle');
           if (btn) btn.setAttribute('aria-expanded', 'true');
+          if (c.dataset.lazyPreview === 'true') void this._loadCardPreview(c);
         });
         return;
       }
@@ -2268,21 +2350,17 @@ class Plugin extends AppPlugin {
           if (btn) {
             btn.setAttribute('aria-expanded', card.classList.contains('rv-card--preview-open') ? 'true' : 'false');
           }
+          if (card.classList.contains('rv-card--preview-open') && card.dataset.lazyPreview === 'true') {
+            void this._loadCardPreview(card);
+          }
         }
         return;
       }
       const card = e.target.closest('.rv-card');
       if (!card) return;
       const guid = card.dataset.recordGuid;
-      const record = this.data.getRecord(guid);
-      if (!record) return;
-      const newPanel = await this.ui.createPanel({ afterPanel: searchPanel });
-      if (newPanel) newPanel.navigateTo({
-        type: 'edit_panel',
-        rootId: record.guid,
-        subId: null,
-        workspaceGuid: this.getWorkspaceGuid(),
-      });
+      if (!this.data.getRecord(guid)) return;
+      await this._openRecordPanel(searchPanel, guid);
     });
   }
 }
@@ -2507,6 +2585,13 @@ function _sortSearchRows(rows, mode, recordColMap) {
   return out;
 }
 
+function _safeAlert(msg) { try { alert(msg); } catch { /* sandbox may block */ } }
+
+/** Checked collection GUIDs from the sidebar as a Set. */
+function _getSelectedColGuids(el) {
+  return new Set([...el.querySelectorAll('.rv-col-list input:checked')].map(cb => cb.dataset.colGuid));
+}
+
 /** Plural label for "Showing X of Y …" */
 function _countNoun(total, isJournal) {
   if (isJournal) return total === 1 ? 'journal entry' : 'journal entries';
@@ -2537,7 +2622,7 @@ function _renderLoadMoreBar(hasPrev, hasNext) {
 
 /** Toolbar: count, per-page (40/50/60), expand/collapse, sort (non-journal), load previous/next. */
 function _resultsToolbarHtml(pageStart, batchLen, total, pageSize, isJournal, sortMode = 'modified', opts = {}) {
-  const { listFilterTotalBefore } = opts;
+  const { listFilterTotalBefore, noLoadMoreBar } = opts;
   let rangeText = _countRangeLabel(pageStart, batchLen, total, isJournal);
   if (listFilterTotalBefore != null && listFilterTotalBefore > total) {
     rangeText += ` <span class="rv-filter-meta">(${listFilterTotalBefore} total before filter)</span>`;
@@ -2574,7 +2659,7 @@ function _resultsToolbarHtml(pageStart, batchLen, total, pageSize, isJournal, so
     </span>
   </div>
   ${sortRow}
-  ${_renderLoadMoreBar(hasPrev, hasNext)}
+  ${noLoadMoreBar ? '' : _renderLoadMoreBar(hasPrev, hasNext)}
 </div>`;
 }
 
@@ -2792,18 +2877,22 @@ function _extractPropertiesTextForDup(record) {
 }
 
 /** Longer values for expanded card details. */
-function _propDisplayExpanded(prop, record) {
+function _propDisplayValue(prop, record) {
+  const name = prop.field?.label || prop.name || '';
+  if (!name) return null;
   try {
-    const name = prop.field?.label || prop.name || '';
-    if (!name) return null;
     const date = record.date(name);
     if (date) return date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
     const num = record.number(name);
-    if (num != null) return String(num);
+    if (num != null && !Number.isNaN(num)) return String(num);
     const txt = record.text(name);
-    if (txt) return txt.length > 800 ? txt.slice(0, 800) + '…' : txt;
-    return null;
+    if (txt) {
+      const t = String(txt).trim();
+      if (!t) return null;
+      return t.length > 800 ? t.slice(0, 800) + '…' : t;
+    }
   } catch { return null; }
+  return null;
 }
 
 // ─── Duplicates & compare helpers ───────────────────────────────────────────
@@ -3013,10 +3102,16 @@ async function _extractRecordFullText(record, opts = {}) {
 }
 
 async function _recordsWithBodyText(records, includeProps = false) {
-  const out = [];
-  for (const r of records) {
-    const body = await _extractRecordFullText(r, { includeProps });
-    out.push({ record: r, body });
+  const POOL = 6;
+  const out = new Array(records.length);
+  for (let i = 0; i < records.length; i += POOL) {
+    const batch = records.slice(i, i + POOL);
+    const bodies = await Promise.all(
+      batch.map(r => _extractRecordFullText(r, { includeProps }))
+    );
+    for (let j = 0; j < batch.length; j++) {
+      out[i + j] = { record: batch[j], body: bodies[j] };
+    }
   }
   return out;
 }
@@ -3351,23 +3446,7 @@ function _tripleColLineClass(allEq, colIdx, differs) {
 }
 
 /** Display value for one property in compare (locale dates; same filters as card expanded props). */
-function _comparePropertyDisplayValue(record, prop) {
-  const name = prop.field?.label || prop.name || '';
-  if (!name) return null;
-  try {
-    const date = record.date(name);
-    if (date) return date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
-    const num = record.number(name);
-    if (num != null && !Number.isNaN(num)) return String(num);
-    const txt = record.text(name);
-    if (txt) {
-      const t = String(txt).trim();
-      if (!t) return null;
-      return t.length > 800 ? t.slice(0, 800) + '…' : t;
-    }
-  } catch { return null; }
-  return null;
-}
+const _comparePropertyDisplayValue = _propDisplayValue;
 
 /** Sorted "Label: value" lines for compare property panel. */
 function _comparePropertyLinesForDisplay(record) {
@@ -3801,7 +3880,12 @@ function _plainSearchHighlightTermsFromQuery(queryRaw) {
  */
 function _highlightPlainSearchTermsInText(text, terms) {
   if (!text || !terms?.length) return _esc(text);
-  const re = _searchHighlightSubstringRegex(terms);
+  return _highlightWithRegex(text, _searchHighlightSubstringRegex(terms));
+}
+
+/** Apply a pre-built highlight regex to text, returning safe HTML with `<mark>` wraps. */
+function _highlightWithRegex(text, re) {
+  if (!text || !re) return _esc(text);
   const parts = [];
   let last = 0;
   let m;
@@ -4078,7 +4162,7 @@ const SHELL_HTML = `
           <span class="ti ti-circle-x" aria-hidden="true"></span>
         </button>
       </div>
-      <div class="rv-search-hint">Use # for hashtags e.g. #project</div>
+      <div class="rv-search-hint">Use # for hashtags · <b>*</b> for all records</div>
     </div>
 
     <div class="rv-section">
@@ -5479,17 +5563,16 @@ details[open] > .rv-compare-props-summary .rv-compare-props-chevron {
 .rv-diff-grid--props-triple .rv-diff-cell.rv-diff-triple-changed--0 { background: rgba(37, 99, 235, 0.06); }
 .rv-diff-grid--props-triple .rv-diff-cell.rv-diff-triple-changed--1 { background: rgba(234, 179, 8, 0.07); }
 .rv-diff-grid--props-triple .rv-diff-cell.rv-diff-triple-changed--2 { background: rgba(34, 197, 94, 0.06); }
-.rv-diff-grid--props-triple .rv-diff-cell.rv-diff-cell--missing {
+/* Shared missing-cell styles for two-pane and triple-pane property diffs */
+.rv-diff-cell.rv-diff-cell--missing {
   background: rgba(128, 128, 128, 0.05);
   box-shadow: inset 0 0 0 1px rgba(128, 128, 128, 0.13);
 }
-.rv-diff-grid--props-triple .rv-diff-cell.rv-diff-cell--missing .rv-prop-missing {
-  opacity: 0.4;
-}
-.rv-diff-grid--props-triple .rv-diff-cell.rv-diff-cell--missing-0 {
+.rv-diff-cell.rv-diff-cell--missing .rv-prop-missing { opacity: 0.4; }
+.rv-diff-cell.rv-diff-cell--missing-0 {
   box-shadow: inset 3px 0 0 rgba(37, 99, 235, 0.2), inset 0 0 0 1px rgba(128, 128, 128, 0.1);
 }
-.rv-diff-grid--props-triple .rv-diff-cell.rv-diff-cell--missing-1 {
+.rv-diff-cell.rv-diff-cell--missing-1 {
   box-shadow: inset 3px 0 0 rgba(234, 179, 8, 0.32), inset 0 0 0 1px rgba(128, 128, 128, 0.1);
 }
 .rv-diff-grid--props-triple .rv-diff-cell.rv-diff-cell--missing-2 {
@@ -5502,20 +5585,6 @@ details[open] > .rv-compare-props-summary .rv-compare-props-chevron {
 }
 .rv-diff-row.rv-prop-diff-mismatch .rv-diff-cell:first-child { background: rgba(37, 99, 235, 0.06); }
 .rv-diff-row.rv-prop-diff-mismatch .rv-diff-cell:last-child { background: rgba(234, 179, 8, 0.07); }
-/* Keyed props: empty side (—) — softer than mismatch / exclusive */
-.rv-diff-grid--props .rv-diff-cell.rv-diff-cell--missing {
-  background: rgba(128, 128, 128, 0.05);
-  box-shadow: inset 0 0 0 1px rgba(128, 128, 128, 0.13);
-}
-.rv-diff-grid--props .rv-diff-cell.rv-diff-cell--missing .rv-prop-missing {
-  opacity: 0.4;
-}
-.rv-diff-grid--props .rv-diff-cell.rv-diff-cell--missing-0 {
-  box-shadow: inset 3px 0 0 rgba(37, 99, 235, 0.2), inset 0 0 0 1px rgba(128, 128, 128, 0.1);
-}
-.rv-diff-grid--props .rv-diff-cell.rv-diff-cell--missing-1 {
-  box-shadow: inset 3px 0 0 rgba(234, 179, 8, 0.32), inset 0 0 0 1px rgba(128, 128, 128, 0.1);
-}
 .rv-diff-grid--props .rv-diff-del .rv-diff-cell.rv-diff-cell--missing:last-child,
 .rv-diff-grid--props .rv-diff-add .rv-diff-cell.rv-diff-cell--missing:first-child {
   background: rgba(128, 128, 128, 0.05);
@@ -5688,4 +5757,15 @@ details[open] > .rv-compare-props-summary .rv-compare-props-chevron {
 .rv-diff-col-line.rv-diff-triple-changed--0 { background: rgba(37, 99, 235, 0.06); }
 .rv-diff-col-line.rv-diff-triple-changed--1 { background: rgba(234, 179, 8, 0.07); }
 .rv-diff-col-line.rv-diff-triple-changed--2 { background: rgba(34, 197, 94, 0.06); }
+
+/* ── Infinite scroll sentinel ── */
+.rv-scroll-sentinel {
+  height: 1px;
+  width: 100%;
+}
+.rv-loading--inline {
+  padding: 8px 12px;
+  font-size: 12px;
+  opacity: 0.7;
+}
 `;
