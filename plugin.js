@@ -1,10 +1,10 @@
 /**
- * Enhanced Search — Thymer plugin v1.2.0
+ * Enhanced Search — Thymer plugin v1.2.1
  * Cross-collection record viewer with filters (see README).
  * Modes: Search, Duplicates (analysis), Compare (2–3 notes + diff).
  */
 const PLUGIN_NAME = 'Enhanced Search';
-const PLUGIN_VERSION = '1.2.0';
+const PLUGIN_VERSION = '1.2.1';
 
 /** Skip duplicate/similar scans above this many records (per selected collections). */
 const DUPLICATE_SCAN_MAX_RECORDS = 2500;
@@ -156,86 +156,172 @@ class Plugin extends AppPlugin {
   }
 
   async _initPanel(panel) {
-    panel.setTitle(PLUGIN_NAME);
-    const el = panel.getElement();
-    Object.assign(el.style, {
-      position: 'absolute',
-      top: '0',
-      left: '0',
-      right: '0',
-      bottom: '4px',
-      overflow: 'hidden',
-    });
-    el.innerHTML = SHELL_HTML;
+  panel.setTitle(PLUGIN_NAME);
 
-    el.querySelector('.rv-results').innerHTML =
-      '<div class="rv-loading"><span class="rv-spin ti ti-refresh"></span> Loading collections…</div>';
+  const el = panel.getElement();
+  Object.assign(el.style, {
+    position: 'absolute',
+    top: '0',
+    left: '0',
+    right: '0',
+    bottom: '4px',
+    overflow: 'hidden',
+  });
 
-    const cols = await this.data.getAllCollections();
-    this._collections = [...cols].sort((a, b) => {
-      const na = String(a.getName() || '').toLowerCase();
-      const nb = String(b.getName() || '').toLowerCase();
-      const c = na.localeCompare(nb, undefined, { sensitivity: 'base' });
-      return c !== 0 ? c : String(a.getGuid()).localeCompare(String(b.getGuid()));
-    });
-    this._recordColMap = {};
-    this._recordColMapLoadedCols = new Set();
-    this._collectionsMap = new Map();
-    for (const col of this._collections) this._collectionsMap.set(col.getGuid(), col);
+  // ── Stage 1: Immediate shell render (no blocking)
+  el.innerHTML = SHELL_HTML;
 
-    // Build collection checkboxes (alphabetical by name)
-    const colList = el.querySelector('.rv-col-list');
-    this._collections.forEach(col => {
-      const cfg  = col.getConfiguration();
+  const results = el.querySelector('.rv-results');
+  if (results) {
+    results.innerHTML = this._loadingHTML();
+  }
+
+  // Allow browser to paint BEFORE doing any heavy work
+  await this._nextFrame();
+
+  // ── Stage 2: Load data (async, non-blocking UI)
+  const collections = await this._loadCollections();
+
+  // ── Stage 3: Hydrate UI progressively
+  await this._hydrateUI(el, collections);
+
+  // ── Stage 4: Finalize (events, state, initial render)
+  this._finalizeUI(el, panel);
+}
+
+ _nextFrame() {
+  return new Promise(resolve => requestAnimationFrame(resolve));
+}
+  
+  _loadingHTML() {
+  return `
+    <div class="rv-loading">
+      <span class="rv-spin ti ti-refresh"></span>
+      Loading collections…
+    </div>
+  `;
+}
+  
+  async _loadCollections() {
+  const cols = await this.data.getAllCollections();
+
+  const sorted = [...cols].sort((a, b) => {
+    const na = String(a.getName() || '').toLowerCase();
+    const nb = String(b.getName() || '').toLowerCase();
+    const c = na.localeCompare(nb, undefined, { sensitivity: 'base' });
+    return c !== 0 ? c : String(a.getGuid()).localeCompare(String(b.getGuid()));
+  });
+
+  // Build maps (cheap, keep here)
+  this._collections = sorted;
+  this._collectionsMap = new Map();
+  this._recordColMap = {};
+  this._recordColMapLoadedCols = new Set();
+
+  for (const col of sorted) {
+    this._collectionsMap.set(col.getGuid(), col);
+  }
+
+  return sorted;
+}
+
+ async _hydrateUI(el, collections) {
+  const colList = el.querySelector('.rv-col-list');
+  const statusBar = el.querySelector('.rv-status-bar');
+  const dateBar = el.querySelector('.rv-date-bar');
+
+  // ── Collections (chunked render)
+  if (colList) {
+    const frag = document.createDocumentFragment();
+
+    for (let i = 0; i < collections.length; i++) {
+      const col = collections[i];
+      const cfg = col.getConfiguration();
+
       const item = document.createElement('label');
       item.className = 'rv-col-item';
       item.innerHTML = `
         <input type="checkbox" data-col-guid="${col.getGuid()}" checked>
         <span class="ti ti-${cfg.icon || 'stack'}"></span>
-        <span class="rv-col-item-name">${_esc(col.getName())}</span>`;
-      colList.appendChild(item);
-    });
+        <span class="rv-col-item-name">${_esc(col.getName())}</span>
+      `;
 
-    // Status chips
-    const statusBar = el.querySelector('.rv-status-bar');
+      frag.appendChild(item);
+
+      // Yield every 20 items to prevent UI freeze
+      if (i % 20 === 0) {
+        colList.appendChild(frag);
+        await this._nextFrame();
+      }
+    }
+
+    colList.appendChild(frag);
+  }
+
+  // ── Status chips (fast, but still yield once)
+  if (statusBar) {
+    const frag = document.createDocumentFragment();
+
     TASK_STATUSES.forEach(s => {
       const btn = document.createElement('button');
       btn.className = 'rv-chip';
       btn.dataset.status = s.value;
-      btn.innerHTML = `<span class="rv-chip-dot" style="background:${s.color}"></span>${s.label}`;
-      statusBar.appendChild(btn);
+      btn.innerHTML = `
+        <span class="rv-chip-dot" style="background:${s.color}"></span>
+        ${s.label}
+      `;
+      frag.appendChild(btn);
     });
 
-    // Date chips — All sends `@task` in the query; then Today, Tomorrow, …
-    const dateBar = el.querySelector('.rv-date-bar');
-    const allDateBtn = document.createElement('button');
-    allDateBtn.type = 'button';
-    allDateBtn.className = 'rv-chip';
-    allDateBtn.dataset.date = '@task';
-    allDateBtn.textContent = 'All';
-    allDateBtn.title = 'Tasks (@task)';
-    dateBar.appendChild(allDateBtn);
+    statusBar.appendChild(frag);
+  }
+
+  await this._nextFrame();
+
+  // ── Date chips
+  if (dateBar) {
+    const frag = document.createDocumentFragment();
+
+    const allBtn = document.createElement('button');
+    allBtn.type = 'button';
+    allBtn.className = 'rv-chip';
+    allBtn.dataset.date = '@task';
+    allBtn.textContent = 'All';
+    frag.appendChild(allBtn);
+
     DATE_FILTERS.forEach(d => {
       const btn = document.createElement('button');
       btn.className = 'rv-chip';
       btn.dataset.date = d.value;
       btn.textContent = d.label;
-      dateBar.appendChild(btn);
+      frag.appendChild(btn);
     });
 
-    this._pageSize = this._readPageSize();
-    this._bindEvents(el);
-    this._syncSearchClear(el);
-    this._syncDupKindUI(el);
-    this._bindCardActions(el, panel);
-    this._bindMocDialog(el, panel);
+    dateBar.appendChild(frag);
+  }
+} 
+
+ _finalizeUI(el, panel) {
+  this._pageSize = this._readPageSize();
+
+  this._bindEvents(el);
+  this._bindCardActions(el, panel);
+  this._bindMocDialog(el, panel);
+
+  // Defer non-critical UI work
+  requestIdleCallback(() => {
     this._renderPresets(el);
     this._renderDupPresets(el);
-    this._updateTypeSearchCheckboxVisibility(el);
-    this._applyPanelMode(el);
-    this._showEmptySearchState(el);
-  }
+  });
 
+  this._syncSearchClear(el);
+  this._syncDupKindUI(el);
+  this._updateTypeSearchCheckboxVisibility(el);
+
+  this._applyPanelMode(el);
+  this._showEmptySearchState(el);
+} 
+  
   _readPageSize() {
     try {
       const v = parseInt(localStorage.getItem('rv_page_size_' + this.getWorkspaceGuid()) || '50', 10);
@@ -822,6 +908,14 @@ class Plugin extends AppPlugin {
   }
 
   async _appendMoreSearchCards(el) {
+    const MAX_DOM_CARDS = 150;
+    const listEl = el.querySelector('.rv-cards-list');
+    
+    // After appending new cards:
+    while (listEl.children.length > MAX_DOM_CARDS) {
+      listEl.removeChild(listEl.firstChild);
+    }
+    
     if (this._scrollLoading) return;
     const rows = this._scrollMergedRows;
     if (!rows) return;

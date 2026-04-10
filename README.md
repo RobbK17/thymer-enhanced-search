@@ -1,8 +1,12 @@
 # Enhanced Search — Thymer Plugin
 
-**Version 1.2.0**
+**Version 1.2.1**
 
 Cross-collection record viewer with **Search**, **Duplicates**, and **Compare** modes: filters for text, hashtags, tagged dates, task status, journal day/range, and collections; duplicate and similar title/body analysis (optional property fields in body); side-by-side compare with line diff and keyed property diff for two or three notes; and presets for search and duplicate settings.
+
+### 1.2.1
+
+- **Startup:** Fixed a panel **startup delay** that had been introduced during the 1.2.0 refactoring (panel should open promptly again).
 
 ### 1.2.0 — Performance & refactoring
 
