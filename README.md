@@ -1,8 +1,14 @@
 # Enhanced Search — Thymer Plugin
 
-**Version 1.2.1**
+**Version 1.2.2**
 
 Cross-collection record viewer with **Search**, **Duplicates**, and **Compare** modes: filters for text, hashtags, tagged dates, task status, journal day/range, and collections; duplicate and similar title/body analysis (optional property fields in body); side-by-side compare with line diff and keyed property diff for two or three notes; and presets for search and duplicate settings.
+
+### 1.2.2
+
+- **“Loading collections…” / WebKit:** The main empty state now appears **as soon as collection metadata is loaded**, *before* the plugin builds the long **Collections** checkbox list. Previously that list was built first; on slower DOM/style paths (often noticeable in **Safari**), the main thread could stay busy long enough that the spinner never seemed to clear even though work was still in progress. Sidebar hydration also **yields every 10 rows** (was 20) so the UI can update between chunks.
+- **Older WebKit:** **`requestIdleCallback`** is still missing on Safari **before 17.4**; the plugin uses **`setTimeout`** as a fallback so init cannot abort before the UI is shown.
+- **Errors:** If panel init throws, the results area shows a short **error message** instead of leaving the loading spinner up indefinitely.
 
 ### 1.2.1
 

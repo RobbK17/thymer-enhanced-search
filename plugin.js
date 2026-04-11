@@ -1,10 +1,10 @@
 /**
- * Enhanced Search — Thymer plugin v1.2.1
+ * Enhanced Search — Thymer plugin v1.2.2
  * Cross-collection record viewer with filters (see README).
  * Modes: Search, Duplicates (analysis), Compare (2–3 notes + diff).
  */
 const PLUGIN_NAME = 'Enhanced Search';
-const PLUGIN_VERSION = '1.2.1';
+const PLUGIN_VERSION = '1.2.2';
 
 /** Skip duplicate/similar scans above this many records (per selected collections). */
 const DUPLICATE_SCAN_MAX_RECORDS = 2500;
@@ -38,6 +38,15 @@ function _journalDaysForRange(anchor, range) {
     });
   }
   return [d0];
+}
+
+/**
+ * Safari & older WebKit: `requestIdleCallback` is missing until Safari 17.4.
+ * Calling it unguarded throws and aborts panel init (loading spinner never clears).
+ */
+function _scheduleWhenIdle(fn) {
+  if (typeof requestIdleCallback === 'function') requestIdleCallback(fn);
+  else setTimeout(fn, 1);
 }
 
 class Plugin extends AppPlugin {
@@ -156,38 +165,37 @@ class Plugin extends AppPlugin {
   }
 
   async _initPanel(panel) {
-  panel.setTitle(PLUGIN_NAME);
+    panel.setTitle(PLUGIN_NAME);
 
-  const el = panel.getElement();
-  Object.assign(el.style, {
-    position: 'absolute',
-    top: '0',
-    left: '0',
-    right: '0',
-    bottom: '4px',
-    overflow: 'hidden',
-  });
+    const el = panel.getElement();
+    Object.assign(el.style, {
+      position: 'absolute',
+      top: '0',
+      left: '0',
+      right: '0',
+      bottom: '4px',
+      overflow: 'hidden',
+    });
 
-  // ── Stage 1: Immediate shell render (no blocking)
-  el.innerHTML = SHELL_HTML;
+    el.innerHTML = SHELL_HTML;
+    const results = el.querySelector('.rv-results');
+    if (results) results.innerHTML = this._loadingHTML();
 
-  const results = el.querySelector('.rv-results');
-  if (results) {
-    results.innerHTML = this._loadingHTML();
+    await this._nextFrame();
+
+    try {
+      const collections = await this._loadCollections();
+      // Clear "Loading collections…" as soon as metadata is ready — before building hundreds
+      // of sidebar rows. Safari (and other engines) can run that DOM work slowly enough that
+      // the spinner looked stuck even though nothing was wrong.
+      if (results) this._showEmptySearchState(el);
+      await this._hydrateUI(el, collections);
+      this._finalizeUI(el, panel);
+    } catch (err) {
+      console.error(`[${PLUGIN_NAME}] panel init failed`, err);
+      this._showInitError(el, err);
+    }
   }
-
-  // Allow browser to paint BEFORE doing any heavy work
-  await this._nextFrame();
-
-  // ── Stage 2: Load data (async, non-blocking UI)
-  const collections = await this._loadCollections();
-
-  // ── Stage 3: Hydrate UI progressively
-  await this._hydrateUI(el, collections);
-
-  // ── Stage 4: Finalize (events, state, initial render)
-  this._finalizeUI(el, panel);
-}
 
  _nextFrame() {
   return new Promise(resolve => requestAnimationFrame(resolve));
@@ -248,8 +256,8 @@ class Plugin extends AppPlugin {
 
       frag.appendChild(item);
 
-      // Yield every 20 items to prevent UI freeze
-      if (i % 20 === 0) {
+      // Yield every 10 items so slow DOM/style engines (e.g. WebKit) can paint between chunks
+      if (i % 10 === 0) {
         colList.appendChild(frag);
         await this._nextFrame();
       }
@@ -308,18 +316,18 @@ class Plugin extends AppPlugin {
   this._bindCardActions(el, panel);
   this._bindMocDialog(el, panel);
 
-  // Defer non-critical UI work
-  requestIdleCallback(() => {
-    this._renderPresets(el);
-    this._renderDupPresets(el);
-  });
-
   this._syncSearchClear(el);
   this._syncDupKindUI(el);
   this._updateTypeSearchCheckboxVisibility(el);
 
   this._applyPanelMode(el);
-  this._showEmptySearchState(el);
+  // Main empty state is set right after `_loadCollections` so the spinner is not held through sidebar hydration.
+
+  // After loading UI is cleared — presets are non-critical; use idle or setTimeout fallback (Safari).
+  _scheduleWhenIdle(() => {
+    this._renderPresets(el);
+    this._renderDupPresets(el);
+  });
 } 
   
   _readPageSize() {
@@ -359,6 +367,13 @@ class Plugin extends AppPlugin {
     if (!results) return;
     this._matchRows = [];
     results.innerHTML = `<div class="rv-empty"><span class="ti ti-search"></span><div>Enter a search term or select filters</div><div class="rv-empty-sub">Type <b>*</b> for all records</div></div>`;
+  }
+
+  _showInitError(el, err) {
+    const results = el.querySelector('.rv-results');
+    if (!results) return;
+    const detail = err && (err.message || String(err));
+    results.innerHTML = `<div class="rv-empty"><span class="ti ti-alert-triangle"></span><div>Could not finish loading the panel</div><div class="rv-empty-sub">${_esc(detail || 'Unknown error')}</div></div>`;
   }
 
   /** Index records for the given collection GUIDs into `_recordColMap` (skips already-indexed). */
@@ -2341,7 +2356,7 @@ class Plugin extends AppPlugin {
   }
 
   _bindCardActions(el, searchPanel) {
-    el.querySelector('.rv-results').addEventListener('click', async e => {
+    el.querySelector('.rv-results')?.addEventListener('click', async e => {
       if (e.target.closest('.rv-compare-back')) {
         e.preventDefault();
         await this._goBackFromCompareDiff(el);
