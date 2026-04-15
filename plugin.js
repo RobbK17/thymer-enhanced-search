@@ -1,10 +1,10 @@
 /**
- * Enhanced Search — Thymer plugin v1.2.2
+ * Enhanced Search — Thymer plugin v1.2.3
  * Cross-collection record viewer with filters (see README).
  * Modes: Search, Duplicates (analysis), Compare (2–3 notes + diff).
  */
 const PLUGIN_NAME = 'Enhanced Search';
-const PLUGIN_VERSION = '1.2.2';
+const PLUGIN_VERSION = '1.2.3';
 
 /** Skip duplicate/similar scans above this many records (per selected collections). */
 const DUPLICATE_SCAN_MAX_RECORDS = 2500;
@@ -1169,9 +1169,10 @@ class Plugin extends AppPlugin {
   _applyFilterState(el, state) {
     el.querySelector('.rv-search-input').value = state.search || '';
     const valid = new Set(TASK_STATUSES.map(s => s.value));
-    const statuses = (state.statuses || [])
+    let statuses = (state.statuses || [])
       .map(s => (s === 'started' ? 'inprogress' : s))
       .filter(s => valid.has(s));
+    if (statuses.includes('task')) statuses = ['task'];
     el.querySelectorAll('.rv-status-bar .rv-chip').forEach(c => {
       c.classList.toggle('rv-chip--active', statuses.includes(c.dataset.status));
     });
@@ -1264,16 +1265,25 @@ class Plugin extends AppPlugin {
       searchInput.focus();
     });
 
-    // Status chips — toggle (exclusive with tagged date + journal day mode)
+    // Status chips — toggle (exclusive with tagged date + journal day mode).
+    // "All" maps to @task and is mutually exclusive with all other status chips.
     el.querySelector('.rv-status-bar').addEventListener('click', e => {
       const chip = e.target.closest('.rv-chip');
       if (!chip) return;
       this._clearSiblingDateFilters(el, 'status');
-      chip.classList.toggle('rv-chip--active');
+      const val = chip.dataset.status;
+      if (val === 'task') {
+        const wasActive = chip.classList.contains('rv-chip--active');
+        el.querySelectorAll('.rv-status-bar .rv-chip').forEach(c => c.classList.remove('rv-chip--active'));
+        if (!wasActive) chip.classList.add('rv-chip--active');
+      } else {
+        chip.classList.toggle('rv-chip--active');
+        el.querySelector('.rv-status-bar .rv-chip[data-status="task"]')?.classList.remove('rv-chip--active');
+      }
       this._runSearch(el);
     });
 
-    // Tagged date chips — single-select (All = @task); exclusive with task status + journal day mode
+    // Tagged date chips — single-select; exclusive with task status + journal day mode
     el.querySelector('.rv-date-bar').addEventListener('click', e => {
       const chip = e.target.closest('.rv-chip');
       if (!chip) return;
@@ -2477,6 +2487,7 @@ class Plugin extends AppPlugin {
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const TASK_STATUSES = [
+  { value: 'task',       label: 'All',         color: '#6b7280' },
   { value: 'done',       label: 'Done',        color: '#22c55e' },
   { value: 'inprogress', label: 'In progress', color: '#3b82f6' },
   { value: 'important',  label: 'Important',   color: '#f97316' },
@@ -2494,6 +2505,7 @@ const TASK_STATUSES = [
 function _taskStatusTokensOrJoined(statusValues) {
   const vals = (statusValues || []).filter(Boolean);
   if (!vals.length) return '';
+  if (vals.includes('task')) return '@task';
   if (vals.length === 1) return '@' + vals[0];
   return vals.map(s => '@' + s).join(' OR ');
 }

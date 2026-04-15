@@ -1,8 +1,12 @@
 # Enhanced Search — Thymer Plugin
 
-**Version 1.2.2**
+**Version 1.2.3**
 
 Cross-collection record viewer with **Search**, **Duplicates**, and **Compare** modes: filters for text, hashtags, tagged dates, task status, journal day/range, and collections; duplicate and similar title/body analysis (optional property fields in body); side-by-side compare with line diff and keyed property diff for two or three notes; and presets for search and duplicate settings.
+
+### 1.2.3
+
+- **Task status — All:** An **All** chip appears before **Done**. When selected it adds **`@task`** to the Thymer query and **clears every other** task-status chip. It **cannot** be combined with other status chips in the UI; choosing any other chip turns **All** off. (You can still type **`@task`** in the search box as before.)
 
 ### 1.2.2
 
@@ -67,7 +71,7 @@ In the sidebar (Search mode), sections run **Tagged date** → **Journal date** 
 - **Active summary** — In **Search** mode, directly under the mode bar, one line shows what is currently active (e.g. search text, which tagged-date chip, journal day/range, or task statuses). **Section headers** for Tagged date, Journal date, Task status, and Search show a small check when that filter is on.
 - **Combining filters** — **Search text** (the text box) can combine with **at most one** of **Tagged date**, **Journal date**, or **Task status**. Those three are **mutually exclusive**: turning on a chip or day in one clears the other two (e.g. you can use text + task status, or text + tagged date, but not tagged date + journal at once). Header **clear** links only clear that section.
 - **Search** — Plain text plus `#hashtags` (Thymer’s normal search rules). The search box and **include #types** sit after **Task status** and before **Presets**.
-- **Task status** — Chips such as Done, In progress, Important, … (adds `@…` filters to the search). **clear** on the same line clears status chips only.
+- **Task status** — Chips start with **All** (`@task`, all tasks) then Done, In progress, Important, … (other chips add their `@…` tokens). **All** is exclusive with the rest: only one mode — **All** *or* one-or-more specific statuses (combined with **`OR`**). **clear** on the same line clears status chips only.
 - **Tagged date** — Today, Tomorrow, This week, Due, Overdue (adds `@today`, `@week`, etc.). **clear** clears tagged-date chips only.
 - **include #types** — Optional; when a selected collection has a **choice** field named `type` or `types`, merges extra matches on that field from your words and `#tags` (see below).
 - **Journal date** — Picks an anchor **calendar day** and loads journal pages for a **range** (see below). Separate from normal search when active. **clear** clears journal selection.
@@ -111,7 +115,7 @@ In the sidebar (Search mode), sections run **Tagged date** → **Journal date** 
 **Tagged date**, **Journal date**, and **Task status** are **mutually exclusive** in the sidebar (turning on one clears the others). **Search text** can still combine with whichever of those three is active (for example text + task status, or text + tagged date). When **Journal date** is off, the plugin builds **one** Thymer query from the search box plus **either** task-status chips **or** a single tagged-date chip (not both). Everything is turned into **one query** for Thymer:
 
 1. The **entire search box** string is sent **as you typed it** (spaces, `OR` / `AND` / `NOT`, `===`, `!=`, `#tags`, etc. are **not** rewritten by the plugin).  
-2. Any **task status** chips you turned on are sent as `@token` strings; **several chips** are combined with **`OR`** (e.g. `@done OR @inprogress`). **Or** at most one **Tagged date** chip (`@today`, `@tomorrow`, `@week`, `@due`, `@overdue`) — not both; the UI keeps status and tagged date mutually exclusive when you are not in journal mode. You can still type **`@task`** in the search box to scope to tasks.
+2. Any **task status** chips you turned on are sent as `@token` strings. **All** sends **`@task`** only. **Several specific** chips (not **All**) are combined with **`OR`** (e.g. `@done OR @inprogress`). **Or** at most one **Tagged date** chip (`@today`, `@tomorrow`, `@week`, `@due`, `@overdue`) — not both; the UI keeps status and tagged date mutually exclusive when you are not in journal mode. You can still type **`@task`** in the search box to scope to tasks.
 
 Those pieces are combined and run together, so—for example—`report #client` with **Today** and **Done** asks Thymer for results that match **all** of those constraints (as its search language defines).
 
